@@ -1,0 +1,21 @@
+[project]
+name = "distrans"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "discord-py>=2.7.1",
+    "httpx>=0.28.1",
+    "psycopg>=3.3.4",
+    "pyjwt>=2.13.0",
+    "pytest>=9.1.1",
+    "zstandard>=0.25.0",
+]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

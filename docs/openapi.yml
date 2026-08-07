@@ -1,0 +1,5025 @@
+openapi: '3.0.3'
+info:
+  title: Distrans
+  version: '1.0'
+  license:
+    name: Apache-2.0
+    url: https://spdx.org/licenses/Apache-2.0.html
+  description: |
+    Real-time chat API.
+
+    Conventions:
+    - All IDs are decimal strings of 64-bit snowflakes (JS BigInt compatible).
+    - Permission masks (`permissions`, `allow`, `deny`) are 128-bit decimal strings.
+      The defined bits: 0 read_messages, 1 send_messages, 2 delete_messages,
+      3 create_channels, 4 modify_channels, 5 delete_channels, 6 create_roles,
+      7 modify_roles, 8 delete_roles, 9 grant_roles, 10 revoke_roles,
+      11 manage_overwrites, 12 skip_allows, 13 skip_denies, 14 guild_modify,
+      15 add_reactions, 16 delete_reactions, 17 create_emoji, 18 modify_emoji,
+      19 delete_emoji, 20 mention_everyone, 21 add_pins, 22 delete_pins,
+      23 create_webhooks, 24 modify_webhooks, 25 delete_webhooks,
+      26 view_audit_log;
+      bits 27–127 are reserved and rejected on input. The skip bits are read
+      from guild-level (base) permissions only: `skip_denies` makes all channel
+      overwrite deny masks inert for the holder, `skip_allows` makes the allow
+      masks inert; the overwrite tier order is preserved.
+    - `created_at` values are Unix epoch milliseconds.
+    - Errors are always `{ "message": "<text>" }`.
+    - Endpoints that require a JSON body reject a request whose `Content-Type`
+      is not `application/json` with `415` (`UnsupportedMediaType`); an empty
+      body with the right type is `400`. A method that is not allowed on an
+      already-matched path returns `405` with an `Allow` header listing the
+      accepted methods (`MethodNotAllowed`); an unknown path is `404`.
+    - `POST` endpoints that create a resource return `201` (`POST /files`
+      returns `200` instead when the same bytes already exist and are reused).
+    - PATCH endpoints return only fields the client cannot know on its own
+      (server-generated/derived, e.g. `updated_at`); if there are none →
+      `204 No Content`.
+    - PATCH field semantics: an absent field is left unchanged; an explicit
+      `"field": null` clears the field (nullable fields only); an explicit null
+      in a non-nullable field is a 400 with the field's type error.
+    - Text validation profiles (see the custom `format` keywords). All text
+      except passwords is NFKC-normalized first; limits apply to the normalized
+      form and the normalized form is what gets stored (for `password` the exact
+      bytes are used).
+      - `format: username` — allowlist `a-z`, `0-9`, `.`, `_` only; the first
+        and the last characters must be alphanumeric; `..` is forbidden;
+        reserved names are rejected.
+      - `format: display-name` — user-visible names (guild/channel/role names,
+        display names, topics): forbidden codepoints (Cc/Cf controls, format
+        characters such as zero-width/BiDi/tag characters, line/paragraph
+        separators, `Default_Ignorable_Code_Point`, noncharacters,
+        `Bidi_Control`, blank braille pattern, private use area) are rejected
+        with 400 `"'<field>' is invalid"`.
+      - `format: message-body` — message text: forbidden codepoints are
+        stripped server-side before storage, except `\n`/`\t`, ZWNJ/ZWJ, bidi
+        marks/isolates, variation selectors and tag characters; after
+        stripping, empty content is rejected (`"'content' is empty"`) and the
+        codepoint limit applies.
+      - Attachments are derived from `content`: any literal
+        `attachment://<file_id>` (the scheme followed by decimal digits — the
+        backend does not parse markdown, a media token such as
+        `![name](attachment://<id>)` simply contains it) references a file. The
+        unique ids, in first-appearance order, become the message's
+        `attachments`; at most `api.messages.max_attachments` are accepted and
+        every id must reference an existing file, otherwise 400. External
+        `https://…` links are not attachments.
+      - Embeds: a message carries at most `api.messages.max_embeds` rich
+        embeds. Embed text uses the `message-body` profile; validation is
+        strict (a present sub-object requires its fields) and `timestamp` is a
+        non-negative integer Unix epoch in milliseconds, like `created_at`.
+        Embed limits live under `api.embeds.*` (see `GET /limits`).
+      - `format: emoji-name` — custom emoji names: allowlist `a-z`, `0-9`, `_`
+        only (no positional rules), length within
+        `api.emojis.min_name_codepoints` .. `api.emojis.max_name_codepoints`
+        codepoints. Uniqueness is per guild.
+servers:
+  - url: https://localhost/api
+paths:
+  /limits:
+    get:
+      summary: Get API limits
+      description: Public endpoint, no authentication required.
+      operationId: getLimits
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Limits'
+  /terms:
+    get:
+      summary: Get the Terms of Service
+      description: >-
+        Public endpoint, no authentication required. Returns the Terms of Service
+        as a Markdown document (`text/markdown`).
+      operationId: getTerms
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            text/markdown:
+              schema:
+                type: string
+  /privacy:
+    get:
+      summary: Get the Privacy Policy
+      description: >-
+        Public endpoint, no authentication required. Returns the Privacy Policy
+        as a Markdown document (`text/markdown`).
+      operationId: getPrivacy
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            text/markdown:
+              schema:
+                type: string
+  /files:
+    post:
+      summary: Upload a file
+      description: >-
+        Uploads a file and stores it as an immutable object in S3. The body must
+        be non-empty and its `Content-Type` must be allowed by `files.whitelist`
+        (`null` allows every type, an empty list allows none; otherwise only the
+        listed patterns, where an exact `type/subtype` matches that type and a
+        `<type>/*` entry such as `text/*` matches any subtype of that type). The
+        default whitelist is `image/webp`, `image/gif`, `image/png`,
+        `image/jpeg`, `image/jpg`, `text/*`. Supported raster
+        types (WebP/GIF/PNG/JPEG) are re-encoded to WebP (container metadata is
+        dropped) and stored with `Content-Type: image/webp`; the body of a
+        re-encoded type must not exceed `media.files.max_input_bytes`, and a still
+        JPEG is rotated to honor its EXIF orientation. All other whitelisted types
+        are stored raw with the request `Content-Type`, and
+        their metadata is preserved. The body must not exceed `files.max_size`.
+        The object key is `files/{hash}` where `hash` is the hex SHA-256 of the
+        final (possibly re-encoded) bytes, so re-uploading identical bytes reuses
+        the existing file (no second upload). Stored objects are immutable and
+        served with `Cache-Control: public, max-age=31536000, immutable` and
+        `Content-Disposition: attachment` carrying the sanitized original name
+        as `filename` (ASCII fallback) plus
+        `filename*=UTF-8''<percent-encoded>` (RFC 6266/5987), so navigating to
+        `public_url` saves the file under its original name. Embedded resources
+        (`<img>`/`<video>`/`<audio src>`) ignore `Content-Disposition`, so inline
+        rendering and playback are unaffected. The `hash` is `UNIQUE`, so an
+        object always corresponds to a single `File` row and name. Responds with
+        the file metadata and its hash. A file that no message ever references is
+        deleted by the background GC once it is older than `files.gc.grace_s`
+        (the row first, then the S3 object); uploaded-but-unattached files are
+        therefore temporary. Responds `201 Created` when a new file row is
+        inserted, or `200 OK` when the same bytes already exist and the row is
+        reused.
+      operationId: postFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: >-
+            Original file name, within `api.files.max_name_codepoints`
+            codepoints and valid under `format: display-name`.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+        description: >-
+          Any type allowed by `files.whitelist`; raster types are re-encoded to
+          `image/webp`.
+      responses:
+        '200':
+          description: OK (the same bytes already existed; the row was reused)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileUpload'
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileUpload'
+        '400':
+          description: >-
+            Empty body, an invalid raster image, or a missing/invalid `name`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: >-
+            Body exceeds `files.max_size`, or a re-encoded type exceeds
+            `media.files.max_input_bytes`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: Content-Type is not allowed by `files.whitelist`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: File storage is disabled (`files.type` is `none`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /gateway:
+    get:
+      summary: WebSocket gateway
+      description: |
+        Upgrade to WebSocket (Sec-WebSocket-Version: 13). Frame protocol (JSON):
+        client sends `{"op":"identify","d":{"token":"<access token or bot_ token>"}}`
+        (either a JWT access token or a static `bot_` bot token issued via
+        PUT /system/users/{user_id}) and the server replies
+        `{"op":"hello","d":{"heartbeat_interval":<ms>}}`;
+        afterwards the client sends `{"op":"ack"}` every `heartbeat_interval` ms;
+        the server sends dispatch events carrying a `seq`. The server closes the
+        connection if no ack arrives within the threshold.
+      operationId: getGateway
+      security: []
+      responses:
+        '101':
+          description: Switching Protocols
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /auth/token:
+    post:
+      summary: Issue an access token (password grant)
+      operationId: postAuthToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant_type, username, password]
+
+              properties:
+                grant_type:
+                  type: string
+                  enum: [password]
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        '200':
+          description: OK. Sets an HttpOnly `refresh_token` cookie (Path=/api).
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: 'refresh_token=...; Path=/api; Max-Age=...; HttpOnly; Secure; SameSite=Strict'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          description: Bad password or username
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /auth/token/refresh:
+    post:
+      summary: Rotate the refresh token and issue a new access token
+      description: Requires the `refresh_token` cookie. The old token is revoked and replaced.
+      operationId: postAuthTokenRefresh
+      security:
+        - refreshCookie: []
+      responses:
+        '200':
+          description: OK. Sets a new `refresh_token` cookie.
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: 'refresh_token=...; Path=/api; Max-Age=...; HttpOnly; Secure; SameSite=Strict'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '400':
+          description: No `refresh_token` cookie (or unexpected request body)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Bad refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /auth/token/logout:
+    post:
+      summary: Revoke the refresh token (logout)
+      description: Requires the `refresh_token` cookie. Revokes the token and clears the cookie.
+      operationId: postAuthTokenLogout
+      security:
+        - refreshCookie: []
+      responses:
+        '200':
+          description: OK. Clears the `refresh_token` cookie.
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: 'refresh_token=; Path=/api; Max-Age=0; HttpOnly; Secure; SameSite=Strict'
+        '400':
+          description: No `refresh_token` cookie
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Bad, expired or unknown refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /users:
+    get:
+      summary: List users (keyset pagination)
+      operationId: getUsers
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Default 50, max `api.users.max_users_limit` (see GET /limits)
+        - name: after
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserWithId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /users/sync:
+    get:
+      summary: Changed users since a cursor
+      operationId: getUsersSync
+      security:
+        - bearerAuth: []
+      description: >-
+        Global changed-since delta for users. Returns only the ids of present
+        rows whose `updated_at` is newer than `since` (upserts). Soft-deleted
+        users stay present and are therefore listed; the client drops them after
+        fetching one and observing `deleted_at`. Hard deletions are not listed.
+      parameters:
+        - $ref: '#/components/parameters/Since'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsersSync'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /users/@me:
+    get:
+      summary: Get the current user
+      operationId: getMe
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWithId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    patch:
+      summary: Update the current user
+      operationId: patchMe
+      security:
+        - bearerAuth: []
+      description: >-
+        PATCH semantics: an absent field is unchanged; an explicit `null` clears
+        the field (nullable fields only). Every PATCH (including a no-op with
+        only `current_password`) requires `current_password`, verified against
+        the stored hash; on a mismatch the server responds 401
+        `"Bad password"`. Accounts without a password (bots, passwordless
+        users) are rejected with 400 `"User has no password"`. A password
+        change additionally requires the new `password` to differ from
+        `current_password`. The `username` may be changed with the same
+        validation as account creation; a taken username is rejected with 409
+        `"Username is already used"`. Every successful update dispatches a
+        `user_updated` gateway event.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - current_password
+              properties:
+                username:
+                  type: string
+                  format: username
+                  description: >-
+                    New username. Same validation as account creation: min/max
+                    `api.users.min/max_username_codepoints`, allowlist
+                    `a-z`, `0-9`, `.`, `_` (first/last alphanumeric, no `..`),
+                    reserved names rejected with 400 "'username' is reserved".
+                    A username already in use is rejected with 409
+                    "Username is already used". Not nullable: an explicit
+                    `null` is a 400 "'username' is not a string".
+                display_name:
+                  type: string
+                  format: display-name
+                  nullable: true
+                  description: >-
+                    Min `api.users.min_display_name_codepoints`, max
+                    `api.users.max_display_name_codepoints`; forbidden codepoints
+                    (Cc/Cf, zero-width, BiDi, ...) are rejected with 400
+                    "'display_name' is invalid".
+                password:
+                  type: string
+                  description: >-
+                    New password. Min/max per `auth.password`
+                    (`min_password_codepoints` / `max_password_codepoints`,
+                    additionally `max_password_len` in bytes). Requires
+                    `current_password` and must differ from it. On success all
+                    refresh tokens of the user are revoked except the one in the
+                    `refresh_token` cookie when the cookie is sent, otherwise
+                    every refresh token of the user is revoked; all of the
+                    user's push subscriptions are removed in both cases, so the
+                    client must re-register the current device.
+                current_password:
+                  type: string
+                  description: >-
+                    Current password. Required for every PATCH and verified
+                    against the stored hash (mismatch → 401 "Bad password");
+                    max `auth.password.max_password_len` in bytes.
+      responses:
+        '204':
+          description: No Content
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Username is already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /users/@me/avatar:
+    put:
+      summary: Set the current user's avatar
+      description: >-
+        Set an avatar by uploading a static or animated image, within
+        `media.avatar.max_dimensions`, `media.avatar.max_input_bytes` and the
+        `media.avatar` animation caps. The `Content-Type` must be `image/webp`,
+        `image/gif`, `image/png`, `image/jpeg` or `image/jpg`; unsupported types
+        are rejected with `415`. Images are re-encoded to WebP (animations to
+        animated WebP); a still JPEG is rotated to honor its EXIF orientation; the
+        response contains the stored `avatar_hash` (XXHash64, 16 lowercase hex
+        chars). The body must be non-empty.
+        Use `DELETE` to clear the avatar; a PUT never clears it.
+        Every successful change dispatches a `user_updated` gateway event.
+      operationId: putMeAvatar
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          image/webp:
+            schema:
+              type: string
+              format: binary
+          image/gif:
+            schema:
+              type: string
+              format: binary
+          image/png:
+            schema:
+              type: string
+              format: binary
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
+          image/jpg:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Avatar stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [avatar_hash]
+                properties:
+                  avatar_hash:
+                    type: string
+                    pattern: '^[0-9a-f]{16}$'
+        '400':
+          description: >-
+            The body is empty or not a decodable WebP/GIF/PNG/JPEG, or exceeds
+            media.avatar.max_dimensions or the animation caps
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The body exceeds media.avatar.max_input_bytes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: The content type is not image/webp, image/gif, image/png, image/jpeg or image/jpg
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    delete:
+      summary: Clear the current user's avatar
+      description: >-
+        Removes the stored avatar. Idempotent: clearing an account that has no
+        avatar is still 204. Dispatches a `user_updated` gateway event.
+      operationId: deleteMeAvatar
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content (the avatar was cleared)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /users/@me/userdata:
+    get:
+      summary: Get the current user's userdata
+      operationId: getMeUserdata
+      security:
+        - bearerAuth: []
+      description: >-
+        Returns the stored opaque blob as
+        `{"data": <arbitrary JSON value>, "updated_at": <epoch ms>}`. The server
+        does not enforce any schema on `data`; it is whatever the client last
+        stored. When nothing has been stored yet, both `data` and `updated_at`
+        are `null` (never 404). `updated_at` is a non-negative Unix epoch in
+        milliseconds, so a client can tell whether its local copy is stale.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, updated_at]
+                properties:
+                  data:
+                    description: The stored arbitrary JSON value, or null.
+                    nullable: true
+                  updated_at:
+                    type: integer
+                    format: int64
+                    nullable: true
+                    minimum: 0
+                    description: Unix epoch in milliseconds, or null.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    put:
+      summary: Replace the current user's userdata
+      operationId: putMeUserdata
+      security:
+        - bearerAuth: []
+      description: >-
+        Stores `data` as the user's opaque blob, replacing any previous value
+        (full replace, idempotent upsert). The body must be a valid JSON value
+        of any kind (object, array, string, number, boolean or null) and must
+        not exceed `api.users.max_userdata_bytes` (see `GET /limits`). No schema
+        is enforced. Responds `200` with the new `updated_at`. No gateway event
+        is dispatched.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: Any valid JSON value.
+      responses:
+        '200':
+          description: Userdata stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [updated_at]
+                properties:
+                  updated_at:
+                    type: integer
+                    format: int64
+                    minimum: 0
+                    description: Unix epoch in milliseconds.
+        '400':
+          description: >-
+            The body is empty or is not valid JSON (400 "Bad JSON")
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The body exceeds api.users.max_userdata_bytes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /users/@me/guilds/{guild_id}/notifications:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    get:
+      summary: Get the current user's guild notification settings
+      operationId: getMeGuildNotifications
+      security:
+        - bearerAuth: []
+      description: >-
+        Returns the caller's notification settings for the guild. These are
+        personal settings: they are gated only by authentication, not by any
+        guild permission. When the user has never changed them the defaults are
+        returned (`level` = `all_messages`, `suppress_everyone` = false,
+        `suppress_roles` = false, `push` = true), never 404. No gateway event is
+        dispatched. The settings drive the notification fan-out: `level` decides
+        whether the guild's messages produce a browser push (`all_messages`
+        always, `only_mentions` only for a non-suppressed direct/role/`@everyone`
+        mention, `nothing` never), the `suppress_*` flags gate the mention kinds
+        only, and `push` disables pushes for the whole guild.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuildNotificationSettings'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: The guild does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      summary: Update the current user's guild notification settings
+      operationId: patchMeGuildNotifications
+      security:
+        - bearerAuth: []
+      description: >-
+        Partial update of the caller's notification settings for the guild. An
+        absent field is unchanged; an explicit `null` is a type error (400). A
+        body with no recognized field (e.g. `{}`) is 400 "Nothing to update",
+        and unknown fields are ignored. On success responds `204 No Content`; no
+        gateway event is dispatched (like `PUT /users/@me/userdata`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                level:
+                  type: string
+                  enum: [all_messages, only_mentions, nothing]
+                suppress_everyone:
+                  type: boolean
+                suppress_roles:
+                  type: boolean
+                push:
+                  type: boolean
+      responses:
+        '204':
+          description: No Content (the settings were stored)
+        '400':
+          description: >-
+            Empty body, non-object body, no recognized field, invalid level, or
+            a field of the wrong type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: The guild does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+  /users/@me/channels/{channel_id}/notifications:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      summary: Get the current user's channel notification settings
+      operationId: getMeChannelNotifications
+      security:
+        - bearerAuth: []
+      description: >-
+        Returns the caller's notification settings for the channel (text channel
+        or category). These are personal settings: they are gated only by
+        authentication, not by any channel permission. When the user has never
+        changed them the default `level` (`inherit`) is returned, never 404. An
+        unknown channel is 404 "Channel not found". Alongside the stored `level`
+        the response carries the resolved `effective_level`, following the
+        inheritance chain channel -> parent category -> guild: `inherit` on a
+        text channel falls back to its parent category's level (which may itself
+        inherit from the guild), and a category (no parent) falls back to the
+        guild. `effective_level` is never `inherit`. No gateway event is
+        dispatched. The level drives the notification fan-out for the channel
+        (`all_messages` always, `only_mentions` only for a non-suppressed
+        mention, `nothing` never).
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelNotificationSettings'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: The channel does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      summary: Update the current user's channel notification settings
+      operationId: patchMeChannelNotifications
+      security:
+        - bearerAuth: []
+      description: >-
+        Partial update of the caller's notification settings for the channel
+        (text channel or category). An absent field is unchanged; an explicit
+        `null` is a type error (400). A body with no recognized field (e.g.
+        `{}`) is 400 "Nothing to update", and unknown fields are ignored. On
+        success responds `204 No Content`; no gateway event is dispatched.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                level:
+                  type: string
+                  enum: [inherit, all_messages, only_mentions, nothing]
+      responses:
+        '204':
+          description: No Content (the settings were stored)
+        '400':
+          description: >-
+            Empty body, non-object body, no recognized field, invalid level, or
+            a field of the wrong type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: The channel does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+  /users/@me/push-subscriptions:
+    get:
+      summary: List the current user's push subscriptions
+      operationId: listMePushSubscriptions
+      security:
+        - bearerAuth: []
+      description: >-
+        Returns the caller's Web Push subscriptions as an array. The encryption
+        secrets (`p256dh`, `auth`) are never returned. These are personal
+        settings gated only by authentication.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PushSubscription'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      summary: Register a push subscription
+      operationId: createMePushSubscription
+      security:
+        - bearerAuth: []
+      description: >-
+        Stores a browser `PushSubscription` (from `PushManager.subscribe`). An
+        endpoint is globally unique — a browser profile is logged into one
+        account at a time — so posting an endpoint another account registered
+        takes it over (reassigns it to the caller); the previous account stops
+        receiving on that device. Responds `201` when the caller did not own the
+        endpoint before (a new endpoint or a takeover) and `200` with the object
+        when the caller already owned it (re-posting refreshes its keys).
+        `p256dh` must be a valid uncompressed P-256 point and `auth` 16 bytes.
+        At most `api.push.max_subscriptions_per_user` are stored per user;
+        re-posting an endpoint the caller already owns stays allowed at the cap,
+        but taking over another account's endpoint is `400` at the cap. No
+        gateway event is dispatched.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PushSubscriptionInput'
+      responses:
+        '201':
+          description: >-
+            The caller owns the endpoint now and did not before: a new endpoint
+            or a takeover from another account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PushSubscription'
+        '200':
+          description: The caller already owned the endpoint; its keys were refreshed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PushSubscription'
+        '400':
+          description: >-
+            Empty body, non-object body, missing/invalid field, invalid
+            endpoint, P-256 key or auth secret, or the per-user cap reached
+            (including a takeover attempted at the cap)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+  /users/@me/push-subscriptions/{subscription_id}:
+    parameters:
+      - $ref: '#/components/parameters/PushSubscriptionId'
+    delete:
+      summary: Delete a push subscription
+      operationId: deleteMePushSubscription
+      security:
+        - bearerAuth: []
+      description: >-
+        Removes one of the caller's subscriptions. An unknown or foreign id
+        answers 404. On success responds `204 No Content`.
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: The path id is not a decimal snowflake
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: The subscription does not exist or belongs to another user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /users/{user_id}/avatar:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      summary: Get a user's avatar image
+      description: >-
+        Public endpoint, no authentication required. Streams the stored webp
+        (or animated webp) avatar. The `hash` query parameter is required and
+        must equal the user's current `avatar_hash`, otherwise 404. The response
+        is immutable for a given hash, so it is safe to cache.
+      operationId: getUserAvatar
+      security: []
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{16}$'
+      responses:
+        '200':
+          description: OK
+          content:
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Avatar not found (unknown user, no avatar, or hash mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /users/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      summary: Get a user
+      operationId: getUser
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: Malformed user_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /guilds:
+    get:
+      summary: List guilds
+      operationId: getGuilds
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Guild'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /guilds/{guild_id}:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    patch:
+      summary: Update a guild
+      description: >-
+        Requires `guild_modify` on the guild. Only `name` can be changed. A
+        body without a recognized field (e.g. `{}`) is 400 "Nothing to update".
+        Dispatches a `guild_updated` gateway event on success.
+      operationId: patchGuild
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  format: display-name
+                  description: Max `api.guilds.max_name_codepoints`
+      responses:
+        '204':
+          description: No Content
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (guild_modify required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /guilds/{guild_id}/sync:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    get:
+      summary: Changed guild entities since a cursor
+      operationId: getGuildSync
+      security:
+        - bearerAuth: []
+      description: >-
+        Per-guild changed-since delta. Every field is an array of ids of present
+        rows whose `updated_at` is newer than `since` (upserts); entity bodies
+        are never returned. `overwrites` carry their `channel_id` because
+        `(target_type, target_id)` is not unique within a guild. `member_roles`
+        is the caller's complete current role-id set (not filtered by `since`),
+        because grant/revoke hard-delete the row and a delta cannot express
+        revocation. Hard deletions are not listed; the client reconciles them
+        with a periodic full refetch or gateway events. Metadata is readable by
+        any authenticated user.
+      parameters:
+        - $ref: '#/components/parameters/Since'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuildSync'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /guilds/{guild_id}/avatar:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    get:
+      summary: Get a guild's avatar image
+      description: >-
+        Public endpoint, no authentication required. Streams the stored webp
+        (or animated webp) avatar. The `hash` query parameter is required and
+        must equal the guild's current `avatar_hash`, otherwise 404. The
+        response is immutable for a given hash, so it is safe to cache.
+      operationId: getGuildAvatar
+      security: []
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{16}$'
+      responses:
+        '200':
+          description: OK
+          content:
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Avatar not found (unknown guild, no avatar, or hash mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      summary: Set a guild's avatar
+      description: >-
+        Requires `guild_modify` on the guild. Uploads a static or animated
+        image, within `media.avatar.max_dimensions`,
+        `media.avatar.max_input_bytes` and the `media.avatar` animation caps.
+        The `Content-Type` must be `image/webp`, `image/gif`, `image/png`,
+        `image/jpeg` or `image/jpg`; unsupported types are rejected with `415`.
+        Images are re-encoded to WebP
+        (animations to animated WebP); the response contains the stored
+        `avatar_hash` (XXHash64, 16 lowercase hex chars). The body must be
+        non-empty.
+        Use `DELETE` to clear the avatar; a PUT never clears it.
+        Every successful change dispatches a `guild_updated` gateway event.
+      operationId: putGuildAvatar
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          image/webp:
+            schema:
+              type: string
+              format: binary
+          image/gif:
+            schema:
+              type: string
+              format: binary
+          image/png:
+            schema:
+              type: string
+              format: binary
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
+          image/jpg:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Avatar stored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [avatar_hash]
+                properties:
+                  avatar_hash:
+                    type: string
+                    pattern: '^[0-9a-f]{16}$'
+        '400':
+          description: >-
+            The body is empty or not a decodable WebP/GIF/PNG/JPEG, or exceeds
+            media.avatar.max_dimensions or the animation caps
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The body exceeds media.avatar.max_input_bytes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: The content type is not image/webp, image/gif, image/png, image/jpeg or image/jpg
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (guild_modify required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Clear a guild's avatar
+      description: >-
+        Requires `guild_modify` on the guild. Removes the stored avatar.
+        Idempotent: clearing a guild that has no avatar is still 204.
+        Dispatches a `guild_updated` gateway event.
+      operationId: deleteGuildAvatar
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content (the avatar was cleared)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (guild_modify required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /guilds/{guild_id}/emojis:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    get:
+      summary: List a guild's custom emojis
+      description: >-
+        Requires authentication (any logged-in user). Keyset-paginated by emoji
+        `id` (ascending); `after` continues past an id. Only this guild's emojis
+        are returned.
+      operationId: getGuildEmojis
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+          description: >-
+            Default 50; must be > 0 and <= `api.emojis.max_emojis_limit`.
+        - name: after
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Id'
+          description: Return emojis with an id strictly greater than this one.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Emoji'
+        '400':
+          description: A bad/unknown query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Create a custom emoji
+      description: >-
+        Requires `create_emoji` on the guild. The name travels in the query
+        string (the server does not percent-decode query values, so clients must
+        send the name bytes verbatim) and the body is a raw image with
+        `Content-Type` `image/webp`, `image/gif`, `image/png`, `image/jpeg` or
+        `image/jpg` (an unsupported
+        type is `415`). The upload must be within the `media.emoji` caps; it is
+        re-encoded to WebP (animations to animated WebP) and stored. The guild
+        may hold at most `api.guilds.max_emojis` emojis. Names are unique per
+        guild. Dispatches an `emoji_created` gateway event.
+      operationId: postGuildEmoji
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+            format: emoji-name
+      requestBody:
+        required: true
+        content:
+          image/webp:
+            schema:
+              type: string
+              format: binary
+          image/gif:
+            schema:
+              type: string
+              format: binary
+          image/png:
+            schema:
+              type: string
+              format: binary
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
+          image/jpg:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Emoji'
+        '400':
+          description: >-
+            Guild not found, bad image, missing/too long/too short/invalid name,
+            unknown query parameter, or the guild reached `api.guilds.max_emojis`
+            ("Too many emojis")
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (create_emoji required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Emoji name is already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The body exceeds media.emoji.max_input_bytes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: The content type is not image/webp, image/gif, image/png, image/jpeg or image/jpg
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /emojis/{emoji_id}:
+    parameters:
+      - $ref: '#/components/parameters/EmojiId'
+    patch:
+      summary: Rename a custom emoji
+      description: >-
+        Requires `modify_emoji` on the emoji's guild. The body is a JSON object
+        with a single `name` field; the name is not nullable. A duplicate name
+        in the same guild is rejected. Dispatches an `emoji_updated` gateway
+        event.
+      operationId: patchEmoji
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  format: emoji-name
+      responses:
+        '204':
+          description: No Content (renamed)
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (modify_emoji required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Emoji not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Emoji name is already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete a custom emoji
+      description: >-
+        Requires `delete_emoji` on the emoji's guild. Deleting an unknown (or
+        already deleted) emoji is 404. Dispatches an `emoji_deleted` gateway
+        event.
+      operationId: deleteEmoji
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content (deleted)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (delete_emoji required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Emoji not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /emojis/{emoji_id}/icon:
+    parameters:
+      - $ref: '#/components/parameters/EmojiId'
+    get:
+      summary: Get a custom emoji's icon
+      description: >-
+        Public endpoint, no authentication required. Streams the stored webp (or
+        animated webp) icon. The `hash` query parameter is required and must
+        equal the emoji's current `icon_hash`, otherwise 404. The response is
+        immutable for a given hash, so it is safe to cache.
+      operationId: getEmojiIcon
+      security: []
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{16}$'
+      responses:
+        '200':
+          description: OK
+          content:
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Icon not found (unknown emoji or hash mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      summary: Update a custom emoji's icon
+      description: >-
+        Requires `modify_emoji` on the emoji's guild. The body is a raw image
+        with `Content-Type` `image/webp`, `image/gif`, `image/png`, `image/jpeg`
+        or `image/jpg` (an
+        unsupported type is `415`) and must be within the `media.emoji` caps; it
+        is re-encoded to WebP (animations to animated WebP), hashed and stored,
+        replacing the existing icon. On success the new `icon_hash` is returned
+        so the client can fetch the image from
+        `GET /emojis/{emoji_id}/icon?hash={icon_hash}`. Dispatches an
+        `emoji_updated` gateway event.
+      operationId: updateEmojiIcon
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          image/webp:
+            schema:
+              type: string
+              format: binary
+          image/gif:
+            schema:
+              type: string
+              format: binary
+          image/png:
+            schema:
+              type: string
+              format: binary
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
+          image/jpg:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [icon_hash]
+                properties:
+                  icon_hash:
+                    type: string
+                    pattern: '^[0-9a-f]{16}$'
+                    description: >-
+                      XXHash64 of the stored webp icon, 16 lowercase hex chars.
+                      Fetch the image from
+                      `GET /emojis/{emoji_id}/icon?hash={icon_hash}`.
+        '400':
+          description: Bad image or unknown query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (modify_emoji required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          description: The content type is not image/webp, image/gif, image/png, image/jpeg or image/jpg
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Emoji not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The body exceeds media.emoji.max_input_bytes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /guilds/{guild_id}/channels:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    get:
+      summary: List guild channels (full objects)
+      operationId: getGuildChannels
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Channel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Create a channel
+      operationId: postGuildChannel
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, kind]
+              properties:
+                name:
+                  type: string
+                  format: display-name
+                  description: Max `api.channels.max_name_codepoints`
+                topic:
+                  type: string
+                  format: display-name
+                  description: Only for kind="channel"; max `api.channels.max_topic_codepoints`
+                kind:
+                  type: string
+                  enum: ["channel", "category"]
+                parent_id:
+                  allOf:
+                    - $ref: '#/components/schemas/Id'
+                  description: Category channel; forbidden when kind="category"
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (create_channels required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild or parent channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /guilds/{guild_id}/channels/order:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    put:
+      summary: Reorder a guild's channels within one parent (modify_channels required)
+      description: |
+        Sets the order of the children of one scope in a single atomic request.
+        `parent_id` selects the scope: `null`/absent means the root (categories
+        and root channels), otherwise a category id. `channels` must list
+        **exactly** the channels whose parent is that scope, each once, in the
+        desired order; positions are then assigned densely as `0..K-1`.
+
+        Every channel whose index changes must be modifiable by the caller
+        (`modify_channels` computed on that channel); otherwise the request is a
+        403. Channels whose index is unchanged are pinned and need no rights.
+        Only ordering within one scope is affected — channels are not reparented.
+
+        On success the server emits a `channels_reordered` gateway event
+        carrying only `guild_id`; clients refetch
+        `GET /guilds/{guild_id}/channels`.
+      operationId: putGuildChannelsOrder
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channels]
+              properties:
+                parent_id:
+                  allOf:
+                    - $ref: '#/components/schemas/Id'
+                  nullable: true
+                  description: Category id, or null/absent for the root scope
+                channels:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Id'
+      responses:
+        '204':
+          description: No Content
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (a moved channel lacks modify_channels)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild or parent channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /guilds/{guild_id}/messages/search:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    get:
+      summary: Search a guild's messages
+      description: >-
+        Per-guild message search. All filters are optional and combine with AND;
+        each id-list filter accepts a comma-separated list of decimal ids and
+        matches any of them (OR within a filter). Results only include channels
+        where the caller has effective `read_messages`: unreadable channels are
+        silently excluded (never 403). The response is ordered by `sort` (newest
+        first by default, oldest first when requested) and paginated with
+        `offset`/`limit`; `total` is the exact number of matches and does not
+        depend on the requested page.
+      operationId: searchGuildMessages
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: content
+          in: query
+          schema:
+            type: string
+            format: message-body
+          description: >-
+            Case-insensitive substring match on message content. NFKC-normalized
+            and counted in codepoints; must be between
+            `api.search.min_content_codepoints` and
+            `api.search.max_content_codepoints`.
+        - name: authors
+          in: query
+          schema:
+            type: string
+          description: >-
+            Comma-separated user ids; matches messages authored by any of them
+            (at most `api.search.max_filter_ids`).
+        - name: channels
+          in: query
+          schema:
+            type: string
+          description: >-
+            Comma-separated channel ids; matches messages in any of them (at most
+            `api.search.max_filter_ids`).
+        - name: mentions
+          in: query
+          schema:
+            type: string
+          description: >-
+            Comma-separated user ids; matches messages that mention any of them
+            (at most `api.search.max_filter_ids`).
+        - name: mention_roles
+          in: query
+          schema:
+            type: string
+          description: >-
+            Comma-separated role ids; matches messages that mention any of them
+            (at most `api.search.max_filter_ids`).
+        - name: author_types
+          in: query
+          schema:
+            type: string
+          description: Comma-separated subset of `user`, `bot`, `webhook`.
+        - name: has_attachments
+          in: query
+          schema:
+            type: boolean
+          description: >-
+            `true` keeps only messages with at least one attachment; `false` only
+            messages without any.
+        - name: pinned
+          in: query
+          schema:
+            type: boolean
+        - name: after
+          in: query
+          schema:
+            type: integer
+            format: int64
+          description: >-
+            Only messages created at or after this Unix time in milliseconds
+            (inclusive).
+        - name: before
+          in: query
+          schema:
+            type: integer
+            format: int64
+          description: >-
+            Only messages created strictly before this Unix time in
+            milliseconds (exclusive).
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: >-
+            Number of matching messages to skip (offset pagination). Default 0.
+            Ignored by `total`.
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [newest, oldest]
+            default: newest
+          description: >-
+            Sort order by message id: `newest` (default, descending) or
+            `oldest` (ascending).
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Default 25, max `api.messages.max_messages_limit`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuildMessageSearchResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /guilds/{guild_id}/audit-log:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    get:
+      summary: Read a guild's audit log
+      description: >-
+        Per-guild, append-only log of management actions (channels, roles,
+        overwrites, emojis, webhooks, guild updates, moderation). Entries carry
+        the actor and the target ids only, never a before/after payload.
+        Requires the guild-level `view_audit_log` permission. Results are
+        ordered by `sort` (newest first by default) and paginated with
+        `offset`/`limit`; `total` is the exact number of matches and does not
+        depend on the requested page.
+      operationId: getGuildAuditLog
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user
+          in: query
+          schema:
+            type: string
+          description: Decimal user id; keeps only entries performed by that actor.
+        - name: action
+          in: query
+          schema:
+            type: string
+          description: >-
+            Comma-separated action names (any of `guild_name_update`,
+            `guild_avatar_update`, `guild_avatar_delete`, `channel_create`,
+            `channel_name_update`, `channel_topic_update`,
+            `channel_parent_update`, `channel_delete`, `channel_reorder`,
+            `role_overwrite_update`, `member_overwrite_update`, `role_create`,
+            `role_name_update`, `role_permissions_update`, `role_color_update`,
+            `role_mentionable_update`, `role_delete`, `role_reorder`,
+            `role_grant`, `role_revoke`, `emoji_create`, `emoji_name_update`,
+            `emoji_icon_update`, `emoji_delete`, `webhook_create`,
+            `webhook_name_update`, `webhook_avatar_update`,
+            `webhook_avatar_delete`, `webhook_delete`, `message_delete`,
+            `message_pin`, `message_unpin`); matches any of them.
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of matching entries to skip. Default 0.
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [newest, oldest]
+            default: newest
+          description: Sort order by entry id.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Default 25, max `api.audit_log.max_entries_limit`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries, total]
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuditLogEntry'
+                  total:
+                    type: integer
+                    description: Exact number of matches, independent of the page.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing `view_audit_log`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /guilds/{guild_id}/roles:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    get:
+      summary: List guild roles (full objects)
+      operationId: getGuildRoles
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Role'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Create a guild role
+      description: |
+        Requires the granted-permissions rule (the requested permission mask must
+        be a subset of the caller's guild base permissions). The caller must have
+        at least one non-`@everyone` role. The new role is inserted at the
+        bottom (position 1, shifting every other non-`@everyone` role up); the
+        response carries only its id. Ordering is changed only through
+        `PUT /guilds/{guild_id}/roles/order`.
+      operationId: postGuildRoles
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, permissions]
+              properties:
+                name:
+                  type: string
+                  format: display-name
+                  description: >-
+                    Max `api.roles.max_name_codepoints`; forbidden codepoints
+                    (Cc/Cf, zero-width, BiDi, ...) are rejected with 400
+                    "'name' is invalid".
+                permissions:
+                  $ref: '#/components/schemas/PermissionBits'
+                color:
+                  type: integer
+                  minimum: 0
+                  maximum: 16777215
+                  nullable: true
+                mentionable:
+                  type: boolean
+                  nullable: true
+                  description: Defaults to true when absent
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (subset rule or role hierarchy violated)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /guilds/{guild_id}/roles/order:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    put:
+      summary: Reorder guild roles (modify_roles required)
+      description: |
+        Sets the order of the guild's roles in one atomic request. The body's
+        `roles` array must list **every** non-`@everyone` role of the guild
+        exactly once, in the desired order; `@everyone` (role id = guild id)
+        must be absent. Positions are then assigned densely as `1..N`.
+
+        Hierarchy is enforced by pinning: a role the caller cannot move (its
+        current position is at or above the caller's highest role position)
+        must keep its exact index
+        in the list. Roles the caller can move may only be permuted within the
+        segments between pinned roles; moving a pinned role is a 403. A role
+        list that is not a permutation of the guild's roles is a 400.
+
+        On success the server emits a `roles_reordered` gateway event carrying
+        only `guild_id`; clients refetch `GET /guilds/{guild_id}/roles`.
+      operationId: putGuildRolesOrder
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roles]
+              properties:
+                roles:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Id'
+      responses:
+        '204':
+          description: No Content
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (modify_roles, or a pinned role was moved)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Guild not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /roles/{role_id}:
+    parameters:
+      - $ref: '#/components/parameters/RoleId'
+    get:
+      summary: Get a role (full object)
+      operationId: getRole
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleWithGuild'
+        '400':
+          description: Malformed role_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Role not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      summary: Modify a role (modify_roles required)
+      description: |
+        At least one of name / permissions / color / mentionable must be
+        present; `"color": null` counts as present and clears the color. An
+        explicit null in name / permissions is a 400 with the field's type
+        error. The response is 204 — there are no server-derived fields to
+        return. The required
+        permission check includes the new permission mask: the caller may only
+        grant permissions it already has (subset rule). Role hierarchy applies:
+        the role's current position must be strictly below the caller's highest
+        role position.
+        The @everyone role (role_id = guild_id) only accepts a "permissions"
+        change and is subject to the same hierarchy (its position is 0).
+      operationId: patchRole
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  format: display-name
+                  description: >-
+                    Max `api.roles.max_name_codepoints`; forbidden codepoints
+                    (Cc/Cf, zero-width, BiDi, ...) are rejected with 400
+                    "'name' is invalid".
+                permissions:
+                  $ref: '#/components/schemas/PermissionBits'
+                color:
+                  type: integer
+                  minimum: 0
+                  maximum: 16777215
+                  nullable: true
+                  description: null clears the color
+                mentionable:
+                  type: boolean
+                  description: Absent leaves the value unchanged
+      responses:
+        '204':
+          description: No Content
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Role not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete a role (delete_roles required)
+      description: |
+        The @everyone role (role_id = guild_id) cannot be deleted. Role
+        hierarchy applies: the role's position must be strictly below the
+        caller's highest role position. Assigned
+        member roles are cascaded.
+      operationId: deleteRole
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions, or an attempt to delete the @everyone role
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Role not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /roles/{role_id}/users/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/RoleId'
+      - $ref: '#/components/parameters/UserId'
+    put:
+      summary: Grant a role to a member (grant_roles required)
+      description: |
+        Idempotent: granting a role the member already has is a 204 no-op.
+        Role hierarchy: the role's position must be strictly below the caller's
+        highest role position, and the caller's highest position must be strictly
+        above the target member's highest position (consequently a member cannot
+        grant roles to themselves). The @everyone role cannot be granted.
+        Deleted users are reported as 404.
+      operationId: putRoleUser
+      security:
+        - bearerAuth: []
+      responses:
+        '204': { description: No Content }
+        '400':
+          description: Cannot grant the @everyone role
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Role not found or user not found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    delete:
+      summary: Revoke a role from a member (revoke_roles required)
+      description: |
+        Idempotent: revoking a role the member does not have is a 204 no-op.
+        Same role hierarchy and @everyone rules as PUT.
+      operationId: deleteRoleUser
+      security:
+        - bearerAuth: []
+      responses:
+        '204': { description: No Content }
+        '400':
+          description: Cannot revoke the @everyone role
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: Role not found or user not found
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  /guilds/{guild_id}/members/{user_id}/roles:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+      - $ref: '#/components/parameters/UserId'
+    get:
+      summary: List role IDs assigned to a member (projection)
+      operationId: getMemberRoles
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK — resolve roles via GET /guilds/{guild_id}/roles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /channels/{channel_id}:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      summary: Get a channel
+      operationId: getChannel
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelWithGuild'
+        '400':
+          description: Malformed channel_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      summary: Modify a channel (modify_channels required)
+      description: >-
+        At least one of name / topic / parent_id must be present.
+        `"name": null` is a 400 ("'name' is not a string") — name is
+        non-nullable; `"topic": null` resets the topic. `"parent_id": null`
+        moves the channel to the root; a category only accepts an absent or
+        null parent_id. The new parent must exist, belong to the same guild
+        and be a category.
+      operationId: patchChannel
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  format: display-name
+                  description: Max `api.channels.max_name_codepoints`
+                topic:
+                  type: string
+                  format: display-name
+                  nullable: true
+                  description: null resets the topic
+                parent_id:
+                  type: string
+                  pattern: '^[0-9]+$'
+                  nullable: true
+                  description: Category channel; forbidden for categories
+      responses:
+        '204':
+          description: No Content
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Channel or new parent channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete a channel (delete_channels required)
+      description: Child channels are not deleted; their parent_id becomes null.
+      operationId: deleteChannel
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /channels/{channel_id}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      summary: List messages (keyset pagination)
+      description: before/after/around are mutually exclusive.
+      operationId: getMessages
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Default 50, max `api.messages.max_messages_limit`
+        - name: before
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: after
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: around
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Message'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (read_messages required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Send a message (send_messages required)
+      description: >-
+        `content` follows `format: message-body`: it must be valid UTF-8;
+        forbidden codepoints (controls except \n/\t, BiDi overrides, zero-width,
+        tag characters are kept — see the conventions section) are stripped
+        server-side before storage. After stripping, the content must not be
+        empty and must not exceed `api.messages.max_codepoints_per_message`
+        codepoints. An optional `reply_to_id` must reference an existing
+        (not deleted) message in the same channel; a missing, deleted or
+        other-channel target is rejected with 400 "'reply_to_id' is invalid".
+        An optional `embeds` is a list of at most `api.messages.max_embeds`
+        rich embeds (see the `Embed` schema); `null` or `[]` stores no embeds.
+        Attachments are derived from `content`: every `attachment://<file_id>`
+        reference yields a file id, deduplicated in first-appearance order.
+        At most `api.messages.max_attachments` unique
+        ids are accepted and every id must reference an existing file.
+      operationId: postMessage
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  format: message-body
+                reply_to_id:
+                  $ref: '#/components/schemas/Id'
+                  nullable: true
+                embeds:
+                  type: array
+                  nullable: true
+                  items:
+                    $ref: '#/components/schemas/Embed'
+                  description: >-
+                    At most `api.messages.max_embeds`; `null` or an empty array
+                    means no embeds.
+                allowed_mentions:
+                  allOf:
+                    - $ref: '#/components/schemas/AllowedMentions'
+                  nullable: true
+                  description: >-
+                    Filters which mentions parsed from `content` take effect; it
+                    does not rewrite `content` and never rejects the message.
+                    Absent = allow `users`, `roles` and `everyone`.
+            example:
+              content: Hello, world!
+              reply_to_id: null
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: >-
+            Bad JSON, content missing/not a string/empty/too long (max
+            `api.messages.max_codepoints_per_message` after stripping),
+            invalid UTF-8, an invalid reply target, an invalid embed, or a
+            content attachment reference that is too many or does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (send_messages required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /channels/{channel_id}/messages/sync:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      summary: Changed channel messages since a cursor
+      operationId: getChannelMessagesSync
+      security:
+        - bearerAuth: []
+      description: >-
+        Returns only the ids of present messages changed since `since` (upserts).
+        Requires `read_messages` on the channel. A soft-deleted message stays
+        present and is therefore listed; the client drops it after fetching it
+        and observing `deleted_at`. Hard deletions are not listed.
+      parameters:
+        - $ref: '#/components/parameters/Since'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagesSync'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /channels/{channel_id}/webhooks:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      summary: List the channel's webhooks
+      description: >-
+        Returns the channel's live (non-soft-deleted) webhooks in id order.
+        Readable by any authenticated user (metadata is not permission-gated);
+        the execute token is never included.
+      operationId: getChannelWebhooks
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Webhook'
+        '400':
+          description: Malformed channel_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Create a webhook (create_webhooks required)
+      description: >-
+        Creates a webhook on the channel. The channel must hold fewer than
+        `api.webhooks.max_webhooks_per_channel` live webhooks, otherwise the
+        request is rejected with 400 "'webhooks' is too many". The response is
+        `201 {"id","token"}`; the plaintext `token` is returned exactly once and
+        only its sha256 is stored. Soft-deleted webhooks do not count against
+        the cap. Dispatches a `webhook_created` gateway event.
+      operationId: postChannelWebhook
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookInput'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookToken'
+        '400':
+          description: >-
+            Bad JSON, "'name' is missing"/"'name' is not a string"/"'name' is
+            too long"/"'name' is invalid", or "'webhooks' is too many"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (create_webhooks required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+  /channels/{channel_id}/pins:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      summary: List pinned message ids (keyset pagination)
+      description: >-
+        Returns the ids (decimal strings, ascending) of the channel's pinned
+        non-deleted messages. `before` and `after` are mutually exclusive.
+      operationId: getChannelPins
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Default 50, max `api.messages.max_messages_limit`
+        - name: before
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: after
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Id'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (read_messages required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /channels/{channel_id}/pins/{message_id}:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+      - $ref: '#/components/parameters/MessageId'
+    put:
+      summary: Pin a message (add_pins required)
+      description: >-
+        Idempotent. The message must exist in the path channel and not be
+        deleted. A real `false -> true` transition dispatches a
+        `message_pinned` gateway event.
+      operationId: pinMessage
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: Malformed channel_id or message_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (add_pins required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel not found; or message not found in the channel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Unpin a message (delete_pins required)
+      description: >-
+        Idempotent. The message must exist in the path channel and not be
+        deleted. A real `true -> false` transition dispatches a
+        `message_unpinned` gateway event.
+      operationId: unpinMessage
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: Malformed channel_id or message_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (delete_pins required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel not found; or message not found in the channel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /messages/{message_id}:
+    parameters:
+      - $ref: '#/components/parameters/MessageId'
+    get:
+      summary: Get a message (read_messages on the message's channel required)
+      operationId: getMessage
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageWithoutId'
+        '400':
+          description: Malformed message_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (read_messages required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      summary: Edit a message (author only, no permission checks)
+      description: >-
+        Only the author of the message may edit it.
+        `content` follows the same rules as POST /channels/{channel_id}/messages.
+        An optional `embeds` replaces the message's embeds: absent leaves them
+        unchanged, an explicit `null` or an empty array clears them, and a
+        non-empty array is validated exactly like POST.
+        Attachments are always derived from `content` and replace the message's
+        attachment set: every `attachment://<file_id>` reference in the new
+        content is a file id (deduplicated, first-appearance order), at most
+        `api.messages.max_attachments` unique ids, each of which must exist. An
+        edit that drops a reference also drops the file association (letting the
+        GC collect it).
+        Mentions (`mention_everyone`, `mentions`, `mention_roles`) are always
+        recomputed from the new `content`; `allowed_mentions` is not accepted on
+        edit because edits never notify.
+        Returns the updated message object (the same shape as `GET`).
+      operationId: editMessage
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  format: message-body
+                embeds:
+                  type: array
+                  nullable: true
+                  items:
+                    $ref: '#/components/schemas/Embed'
+                  description: >-
+                    Replaces the message's embeds. `null` or `[]` clears them;
+                    absent leaves them unchanged; at most
+                    `api.messages.max_embeds` are accepted.
+            example:
+              content: Edited message
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: >-
+            Bad JSON, content missing/not a string/empty/too long (max
+            `api.messages.max_codepoints_per_message` after stripping), an
+            invalid UTF-8, an invalid embed, or a content attachment reference
+            that does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: The caller is not the author of the message
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete a message (author, or a strictly higher moderator with delete_messages)
+      description: >-
+        The author can always delete the own message without any permissions.
+        A non-author needs delete_messages on the message's channel and must
+        be strictly higher in the role hierarchy than the author. Deletion is
+        a soft delete: content is wiped and the message becomes anonymous.
+      operationId: deleteMessage
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: Malformed message_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (non-author without delete_messages or not strictly higher than the author)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /messages/{message_id}/reactions:
+    parameters:
+      - $ref: '#/components/parameters/MessageId'
+    put:
+      summary: Add your own reaction (add_reactions required, idempotent)
+      description: >-
+        Adds the caller's reaction. Re-adding the same emoji is idempotent
+        (still 204). A custom `emoji_id` must belong to the message's guild.
+        A `unicode_emoji` must be exactly one fully-qualified RGI sequence.
+        A new distinct emoji is rejected once the message already holds
+        `api.messages.max_reactions` distinct emoji.
+      operationId: putMessageReaction
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReactionRequest'
+            example:
+              unicode_emoji: "\U0001F44D"
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: >-
+            Bad JSON, not an object, neither/both `emoji_id` and
+            `unicode_emoji`, a non-string target, an unknown/invalid custom
+            emoji (wrong guild) or an invalid unicode sequence, or the
+            message already holds `api.messages.max_reactions` distinct emoji
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (add_reactions required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: >-
+        Remove a reaction (own freely; another user's with delete_reactions and
+        a strictly higher role)
+      description: >-
+        Removes the caller's reaction with the given emoji; with no emoji
+        parameter, removes all of the caller's reactions on the message.
+        With `user_id`, removes that user's reaction instead, which requires
+        `delete_reactions` on the channel and being strictly higher in the role
+        hierarchy than the target. Idempotent (a missing reaction is still 204).
+      operationId: deleteMessageReaction
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: emoji_id
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            Custom emoji id; must belong to the message's guild. Mutually
+            exclusive with `unicode_emoji`.
+        - name: unicode_emoji
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >-
+            A single fully-qualified RGI emoji sequence, percent-encoded.
+            Mutually exclusive with `emoji_id`.
+        - name: user_id
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            Remove this user's reaction instead of the caller's; requires
+            delete_reactions and being strictly higher than the target.
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: >-
+            Malformed message_id, unknown parameter, both emoji parameters,
+            invalid `emoji_id` / `unicode_emoji` / `user_id`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: >-
+            Missing permissions (removing another user's reaction without
+            delete_reactions or without being strictly higher than the target)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /messages/{message_id}/reactions/users:
+    parameters:
+      - $ref: '#/components/parameters/MessageId'
+    get:
+      summary: List the users who reacted with one emoji (read_messages required)
+      description: >-
+        Returns the ids of the users who reacted to the message with exactly the
+        requested emoji, ascending by user id. Soft-deleted users are excluded,
+        so the array length matches the corresponding `count` of
+        `GET /messages/{message_id}/reactions`. Returns an empty array (not 404)
+        when nobody reacted with that emoji.
+      operationId: getMessageReactionUsers
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: emoji_id
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            Custom emoji id; must belong to the message's guild. Mutually
+            exclusive with `unicode_emoji`; exactly one is required.
+        - name: unicode_emoji
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >-
+            A single fully-qualified RGI emoji sequence, percent-encoded.
+            Mutually exclusive with `emoji_id`; exactly one is required.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: >-
+            Default 50; must be > 0 and
+            <= `api.messages.max_reactions_users_limit` (see GET /limits).
+        - name: after
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/Id'
+          description: Keyset cursor; return users with a strictly greater id.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Id'
+        '400':
+          description: >-
+            Malformed message_id, unknown parameter, neither/both emoji
+            parameters, invalid `emoji_id` / `unicode_emoji` / `after`, or a
+            `limit` outside 1..100
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (read_messages required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /channels/{channel_id}/overwrites:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    put:
+      summary: Create or update a channel permission overwrite (upsert)
+      operationId: putOverwrite
+      description: >-
+        Upserts an overwrite for a role or member on the channel. Setting
+        both `allow` and `deny` to `"0"` removes the overwrite. Requires
+        `manage_overwrites` computed on the channel. Every bit flipped by
+        the request (XOR of the old/new `allow` and old/new `deny`; all set
+        `allow|deny` bits when creating) must be present in the caller's
+        channel permissions. Target hierarchy: a member target must be
+        strictly below the caller's highest role position (self-overwrites
+        are always allowed, even with no roles), a role target's position
+        must be strictly below the caller's highest role position.
+        An identical `allow`/`deny` pair is an idempotent no-op (204) and
+        bypasses the hierarchy checks.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_id, type, allow, deny]
+              properties:
+                target_id:
+                  $ref: '#/components/schemas/Id'
+                type:
+                  type: string
+                  enum: [role, member]
+                allow:
+                  $ref: '#/components/schemas/PermissionBits'
+                deny:
+                  $ref: '#/components/schemas/PermissionBits'
+      responses:
+        '204':
+          description: Overwrite applied (created, updated, or removed)
+        '400':
+          description: Bad JSON, malformed channel_id, or body validation failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing `manage_overwrites`, a changed bit is not owned by the caller, or a hierarchy violation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel, role, or user not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /webhooks/{webhook_id}:
+    parameters:
+      - $ref: '#/components/parameters/WebhookId'
+    get:
+      summary: Get a webhook
+      description: >-
+        Returns the webhook by id. Soft-deleted rows are still returned (with
+        `deleted_at` set) so messages posted by a deleted webhook keep rendering
+        name/avatar; management endpoints instead treat a deleted webhook as
+        404. Readable by any authenticated user (metadata is not
+        permission-gated).
+      operationId: getWebhook
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          description: Malformed webhook_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      summary: Rename a webhook (modify_webhooks required)
+      description: >-
+        Renames the webhook. An absent `name` is a no-op that still succeeds. A
+        soft-deleted webhook is 404. On success the endpoint returns
+        `204 No Content` (there is no server-derived field to return) and
+        dispatches a `webhook_updated` gateway event.
+      operationId: patchWebhook
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  format: display-name
+                  description: >-
+                    Optional new name. Absent leaves the current name unchanged;
+                    when present it is validated like create.
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: >-
+            Bad JSON, "'name' is not a string"/"'name' is too long"/"'name' is
+            invalid"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (modify_webhooks required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    delete:
+      summary: Delete a webhook (delete_webhooks required)
+      description: >-
+        Soft-deletes the webhook (`deleted_at`). A soft-deleted webhook is 404,
+        so deleting twice returns 404 the second time. The row survives for
+        message attribution. Dispatches a `webhook_deleted` gateway event.
+      operationId: deleteWebhook
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: Malformed webhook_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (delete_webhooks required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /webhooks/{webhook_id}/avatar:
+    parameters:
+      - $ref: '#/components/parameters/WebhookId'
+    get:
+      summary: Get a webhook's avatar image
+      description: >-
+        Public endpoint, no authentication required. Streams the stored webp
+        (or animated webp) avatar. The `hash` query parameter is required and
+        must equal the webhook's current `avatar_hash`, otherwise 404. Unlike
+        the management endpoints, a soft-deleted webhook is still served (like
+        `GET /api/webhooks/{webhook_id}`) so its messages keep rendering. The
+        response is immutable for a given hash, so it is safe to cache.
+      operationId: getWebhookAvatar
+      security: []
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{16}$'
+      responses:
+        '200':
+          description: OK
+          content:
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Avatar not found (unknown webhook, no avatar, or hash mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      summary: Set a webhook avatar (modify_webhooks required)
+      description: >-
+        Uploads a raw image body and stores the re-encoded WebP avatar. The body
+        must be non-empty with a supported raster `Content-Type` (`image/webp`,
+        `image/gif`, `image/png`, `image/jpeg`, `image/jpg`); otherwise
+        `400 "Bad image"` / `415`. An
+        unsupported/empty body is rejected before any encoding. A body over
+        `media.avatar.max_input_bytes` is 413 "Image is too large"; an image that
+        is not a valid WebP/GIF/PNG/JPEG within the `media.avatar` dimension and
+        animation caps is 400 "Bad image". A still JPEG is rotated to honor its
+        EXIF orientation. A soft-deleted webhook is 404.
+        Dispatches a `webhook_updated` gateway event.
+      operationId: putWebhookAvatar
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          image/webp:
+            schema:
+              type: string
+              format: binary
+          image/gif:
+            schema:
+              type: string
+              format: binary
+          image/png:
+            schema:
+              type: string
+              format: binary
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
+          image/jpg:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  avatar_hash:
+                    type: string
+                    pattern: '^[0-9a-f]{16}$'
+        '400':
+          description: Empty or malformed image ("Bad image")
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (modify_webhooks required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Image is too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    delete:
+      summary: Clear a webhook avatar (modify_webhooks required)
+      description: >-
+        Clears the avatar; idempotent (a webhook without an avatar still returns
+        204). A soft-deleted webhook is 404. Dispatches a `webhook_updated`
+        gateway event.
+      operationId: deleteWebhookAvatar
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: Malformed webhook_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (modify_webhooks required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Webhook not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /webhooks/{webhook_id}/{token}:
+    post:
+      summary: Execute a webhook (token-authenticated, no session)
+      description: >-
+        Posts a message into the webhook's channel as the webhook. The token is
+        the capability: there is no session, no bearer auth, and no channel
+        permission check (mirroring `POST /channels/{channel_id}/messages`).
+        The webhook must exist, not be soft-deleted and `token` must hash to its
+        stored `token_hash`; anything else is 404. The body is validated exactly
+        like `POST /channels/{channel_id}/messages` (`content`, `reply_to_id`,
+        `embeds`, `mentions`, `allowed_mentions`, and attachments derived from
+        `content`); the stored message has `author_id` null and `webhook_id` set.
+        A `message_created` gateway event and push notifications are emitted like
+        a user message; the push payload carries the author's `author_id` (null
+        for a webhook), `author_name`, `author_avatar_hash` and `webhook_id` so
+        the client can render the author without an extra lookup. Returns the
+        created message object.
+      operationId: executeWebhook
+      security: []
+      parameters:
+        - name: webhook_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Plaintext execute token from webhook creation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  format: message-body
+                reply_to_id:
+                  $ref: '#/components/schemas/Id'
+                  nullable: true
+                embeds:
+                  type: array
+                  nullable: true
+                  items:
+                    $ref: '#/components/schemas/Embed'
+                allowed_mentions:
+                  allOf:
+                    - $ref: '#/components/schemas/AllowedMentions'
+                  nullable: true
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: >-
+            Bad JSON, content missing/not a string/empty/too long, invalid
+            reply target, invalid embed/mention, a missing attachment reference,
+            or an empty body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Webhook not found (unknown, soft-deleted, or bad token)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+  /webhooks/{webhook_id}/{token}/github:
+    post:
+      summary: Execute a GitHub-compatible webhook (token-authenticated, no session)
+      description: >-
+        GitHub integration endpoint. Configure this URL as
+        the "Payload URL" of a repository/organization webhook on GitHub. The
+        `X-GitHub-Event` header selects the event; the JSON (or
+        `application/x-www-form-urlencoded` `payload=`) body is rendered into a
+        single rich embed and posted into the webhook's channel as the webhook
+        (attribution uses the webhook's configured `name`/avatar). No signature verification
+        (`X-Hub-Signature*` is ignored) and no delivery deduplication: the URL
+        token is the capability, exactly like `POST /webhooks/{webhook_id}/{token}`.
+        Supported events: `commit_comment`, `create`, `delete`, `fork`,
+        `issue_comment`, `issues`, `member`, `public`, `pull_request`,
+        `pull_request_review`, `pull_request_review_comment`, `push`, `release`,
+        `watch`, `check_run`, `check_suite`, `discussion`,
+        `discussion_comment`, `repository`. Any other event (including `ping`)
+        and unsupported actions answer 204 without posting. Success is always
+        204; there is no `wait`.
+      operationId: executeGitHubWebhook
+      security: []
+      parameters:
+        - name: webhook_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Plaintext execute token from webhook creation.
+        - name: X-GitHub-Event
+          in: header
+          required: true
+          schema:
+            type: string
+          description: GitHub event name (e.g. `push`, `issues`).
+      requestBody:
+        required: true
+        description: >-
+          The raw GitHub webhook payload (`application/json`, or
+          `application/x-www-form-urlencoded` with a `payload` field).
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                payload:
+                  type: string
+      responses:
+        '204':
+          description: >-
+            Accepted: the event was rendered and posted, or intentionally
+            ignored (unsupported event/action).
+        '400':
+          description: Missing `X-GitHub-Event`, empty body, or bad JSON payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Webhook not found (unknown, soft-deleted, or bad token)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body larger than `api.github.max_body_bytes`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+  /system/users:
+    post:
+      summary: Create a user (passwordless when password omitted; bots must not have a password)
+      operationId: postSystemUser
+      security:
+        - systemToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                id:
+                  allOf:
+                    - $ref: '#/components/schemas/Id'
+                  description: Optional custom snowflake
+                username:
+                  type: string
+                  format: username
+                  description: >-
+                    Allowlist `a-z`, `0-9`, `.`, `_`; the first and the last
+                    characters must be alphanumeric; `..` is forbidden; max
+                    `api.users.max_username_codepoints`, min
+                    `api.users.min_username_codepoints`; reserved names are
+                    rejected.
+                password:
+                  type: string
+                  description: Forbidden for bots
+                is_bot:
+                  type: boolean
+                display_name:
+                  type: string
+                  format: display-name
+                  description: Max `api.users.max_display_name_codepoints`
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          description: Bad system token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /system/users/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      summary: Edit a user
+      description: >-
+        Edits `username`, `display_name` and `password`. Absent fields are left
+        unchanged; explicit `null` clears `display_name` or `password` (making
+        the account passwordless). `username` cannot be cleared. A password is
+        forbidden for bot accounts. Setting or clearing a password revokes all
+        refresh tokens of the user and removes all of the user's push
+        subscriptions. Avatars are managed by
+        `PUT /users/@me/avatar`.
+      operationId: patchSystemUser
+      security:
+        - systemToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                  format: username
+                  description: >-
+                    Allowlist `a-z`, `0-9`, `.`, `_`; the first and the last
+                    characters must be alphanumeric; `..` is forbidden; max
+                    `api.users.max_username_codepoints`, min
+                    `api.users.min_username_codepoints`; reserved names are
+                    rejected.
+                display_name:
+                  type: string
+                  nullable: true
+                  format: display-name
+                  description: >-
+                    Min `api.users.min_display_name_codepoints`, max
+                    `api.users.max_display_name_codepoints`.
+                password:
+                  type: string
+                  nullable: true
+                  description: >-
+                    Min `auth.password.min_password_codepoints`, max
+                    `auth.password.max_password_codepoints` codepoints and
+                    `auth.password.max_password_len` bytes; forbidden for bots.
+      responses:
+        '204':
+          description: No Content
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          description: Bad system token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Username is already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      summary: Issue (or rotate) the static bot token of a user
+      description: >-
+        Only bot accounts (`is_bot`) carry a static token. Exactly one token
+        exists per bot: re-issuing revokes the previous token. The plaintext
+        token is returned once; the server stores only its SHA-256 hash. Bot
+        tokens have no expiry and are accepted by `bearerAuth` and the gateway
+        `identify`.
+      operationId: putSystemUserBotToken
+      security:
+        - systemToken: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token:
+                    type: string
+                    pattern: '^bot_[A-Za-z0-9_-]{43}$'
+                    description: Static bot token (base64url of 32 random bytes)
+        '401':
+          description: Bad system token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found (or already deleted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: User is not a bot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Soft-delete a user
+      operationId: deleteSystemUser
+      security:
+        - systemToken: []
+      responses:
+        '204':
+          description: No Content
+        '401':
+          description: Bad system token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /system/guilds:
+    post:
+      summary: Create a guild
+      operationId: postSystemGuild
+      security:
+        - systemToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                id:
+                  allOf:
+                    - $ref: '#/components/schemas/Id'
+                  description: Optional custom snowflake
+                name:
+                  type: string
+                  format: display-name
+                  description: Max `api.guilds.max_name_codepoints`
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          description: Bad system token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /system/guilds/{guild_id}:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+    delete:
+      summary: Delete a guild
+      operationId: deleteSystemGuild
+      security:
+        - systemToken: []
+      responses:
+        '204':
+          description: No Content
+        '401':
+          description: Bad system token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /system/guilds/{guild_id}/roles/{role_id}:
+    parameters:
+      - $ref: '#/components/parameters/GuildId'
+      - $ref: '#/components/parameters/RoleId'
+    delete:
+      summary: Delete a role
+      description: The @everyone role (role_id = guild_id) cannot be deleted.
+      operationId: deleteSystemRole
+      security:
+        - systemToken: []
+      responses:
+        '204':
+          description: No Content
+        '401':
+          description: Bad system token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Cannot delete the @everyone role
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /system/superuser:
+    post:
+      summary: Create a superuser role and assign it to a user
+      operationId: postSystemSuperuser
+      security:
+        - systemToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [guild_id, user_id]
+              properties:
+                guild_id:
+                  $ref: '#/components/schemas/Id'
+                user_id:
+                  $ref: '#/components/schemas/Id'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '401':
+          description: Bad system token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        JWT access token from POST /auth/token. Also accepts static `bot_`
+        bot tokens issued via PUT /system/users/{user_id} (no expiry; revoked
+        when re-issued or when the bot is deleted).
+    systemToken:
+      type: http
+      scheme: bearer
+      description: Static system token from the server config (`auth.system_token`).
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+      description: HttpOnly `refresh_token` cookie issued by POST /auth/token (Path=/api).
+  parameters:
+    GuildId:
+      name: guild_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    ChannelId:
+      name: channel_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    MessageId:
+      name: message_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    RoleId:
+      name: role_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    EmojiId:
+      name: emoji_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    PushSubscriptionId:
+      name: subscription_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    WebhookId:
+      name: webhook_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    Since:
+      name: since
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+      description: >-
+        Epoch milliseconds high-water mark. Omitted defaults to the start of the
+        lookback window (`sync.max_lookback_s` of GET /limits). A value older
+        than that window is rejected with 400 "'since' is too old"; a
+        non-numeric, negative, or implausibly future value is 400 "'since' is
+        invalid". The response's `updated_at` is the cursor to pass next.
+  responses:
+    BadRequest:
+      description: Bad request (invalid JSON, validation failure, or unknown resource reported as 400 by some GET endpoints)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing, malformed or expired bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Missing permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnsupportedMediaType:
+      description: The Content-Type is not application/json (or not a supported image type)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    MethodNotAllowed:
+      description: >-
+        The method is not allowed for this path; the `Allow` header lists the
+        accepted methods
+      headers:
+        Allow:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+    Id:
+      type: string
+      pattern: '^[0-9]+$'
+      description: Decimal string of a 64-bit snowflake ID (JS BigInt compatible)
+    GuildNotificationSettings:
+      type: object
+      required: [level, suppress_everyone, suppress_roles, push]
+      description: The caller's notification settings for a guild.
+      properties:
+        level:
+          type: string
+          enum: [all_messages, only_mentions, nothing]
+          description: >-
+            Default `all_messages`. `only_mentions` notifies only on mentions;
+            `nothing` suppresses all notifications for the guild.
+        suppress_everyone:
+          type: boolean
+          description: Ignore @everyone and @here. Default false.
+        suppress_roles:
+          type: boolean
+          description: Do not notify on role mentions. Default false.
+        push:
+          type: boolean
+          description: >-
+            Whether the guild may produce browser push notifications. Default true.
+    ChannelNotificationSettings:
+      type: object
+      required: [level, effective_level]
+      description: The caller's notification settings for a text channel or category.
+      properties:
+        level:
+          type: string
+          enum: [inherit, all_messages, only_mentions, nothing]
+          description: >-
+            The stored level. Default `inherit`: fall back to the parent
+            category (text channels) and then the guild. `nothing` suppresses
+            notifications for the channel regardless of the guild.
+        effective_level:
+          type: string
+          enum: [all_messages, only_mentions, nothing]
+          description: >-
+            The fully resolved level (never `inherit`), following the chain
+            channel -> parent category -> guild. Lets a client render the
+            "use default" option's current value without extra requests.
+    PushSubscription:
+      type: object
+      required: [id, endpoint, created_at]
+      description: >-
+        A stored browser push subscription (secrets omitted). An endpoint is
+        globally unique: it belongs to exactly one account (the one currently
+        logged in in that browser profile).
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        endpoint:
+          type: string
+          description: The push service URL from `PushSubscription.endpoint`.
+        created_at:
+          type: integer
+          description: Unix epoch in milliseconds.
+    PushSubscriptionInput:
+      type: object
+      required: [endpoint, p256dh, auth]
+      description: >-
+        A browser `PushSubscription` to register. Registering an endpoint
+        already owned by another account takes it over (moves it to the
+        caller).
+      properties:
+        endpoint:
+          type: string
+          format: uri
+          description: >-
+            Absolute `http(s)` push service URL, within
+            `api.push.max_endpoint_bytes` bytes. Stored verbatim (never
+            normalized).
+        p256dh:
+          type: string
+          description: >-
+            base64url (no padding) of the subscription's uncompressed P-256
+            public key (65 bytes; `PushSubscription.getKey('p256dh')`).
+        auth:
+          type: string
+          description: >-
+            base64url (no padding) of the 16-byte authentication secret
+            (`PushSubscription.getKey('auth')`).
+    Webhook:
+      type: object
+      required: [id, guild_id, channel_id, name, avatar_hash, created_at, deleted_at]
+      description: >-
+        A per-channel webhook. It carries no owner: management is gated purely
+        by the channel's `create_webhooks` / `modify_webhooks` /
+        `delete_webhooks` permissions. The execute token is never included.
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        guild_id:
+          $ref: '#/components/schemas/Id'
+        channel_id:
+          $ref: '#/components/schemas/Id'
+        name:
+          type: string
+          format: display-name
+          description: >-
+            Max `api.webhooks.max_name_codepoints`; forbidden codepoints are
+            rejected with 400 "'name' is invalid".
+        avatar_hash:
+          type: string
+          nullable: true
+          description: >-
+            Hex XXHash64 of the stored WebP avatar (16 lowercase hex chars);
+            null when unset.
+        created_at:
+          type: integer
+          format: int64
+          description: Unix epoch, milliseconds.
+        deleted_at:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            Set when the webhook is soft-deleted. A deleted webhook is gone for
+            management/execute (404) but still returned by
+            `GET /api/webhooks/{webhook_id}` so its messages keep rendering
+            name/avatar.
+    WebhookInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          format: display-name
+          description: >-
+            Webhook name, within `api.webhooks.max_name_codepoints` codepoints
+            and passing the `.name` profile. On PATCH the field is optional: an
+            absent `name` leaves the current one.
+    WebhookToken:
+      type: object
+      required: [id, token]
+      description: >-
+        The create-only response of `POST /api/channels/{channel_id}/webhooks`.
+        The plaintext `token` is shown exactly once and never returned again
+        (list/get never include it); only its sha256 is stored.
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        token:
+          type: string
+          description: >-
+            base64url (no padding) execute token. Present it in the path of
+            `POST /api/webhooks/{webhook_id}/{token}`.
+    File:
+      type: object
+      required: [id, name, size, content_type, hash, public_url]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        name:
+          type: string
+          format: display-name
+          description: >-
+            Original file name, within `api.files.max_name_codepoints`
+            codepoints.
+        size:
+          type: integer
+          format: int64
+          description: Size of the stored object in bytes.
+        content_type:
+          type: string
+          description: >-
+            MIME type of the stored object; always `image/webp` for re-encoded
+            raster uploads (WebP/GIF/PNG/JPEG), otherwise the request
+            `Content-Type`.
+        hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: >-
+            Hex SHA-256 of the bytes and the object key suffix
+            (`files/{hash}`).
+        public_url:
+          type: string
+          nullable: true
+          description: >-
+            `{files.s3.public_base_url}/files/{hash}`; null when storage is
+            disabled. Not access-controlled: anyone with the URL can fetch the
+            object. The object carries a `Content-Disposition` with the
+            sanitized original `name`, so navigating to this URL downloads the
+            file under its original name.
+    Attachment:
+      allOf:
+        - $ref: '#/components/schemas/File'
+        - type: object
+          description: >-
+            A file attached to a message, returned inline in message reads. The
+            `public_url` may be refreshed independently of the message.
+    FileUpload:
+      $ref: '#/components/schemas/File'
+    PermissionBits:
+      type: string
+      pattern: '^[0-9]+$'
+      description: 128-bit permission mask as decimal string
+    AuditLogEntry:
+      type: object
+      description: >-
+        One audit-log entry. `target_id`, `target_user_id` and `channel_id`
+        identify the target of the action and may be null depending on
+        `action`: channel actions carry `channel_id`, role/emoji/webhook/message
+        actions carry `target_id` (with `channel_id` for webhooks/messages),
+        `role_overwrite_update` carries `channel_id` plus `target_id` (role) and
+        `member_overwrite_update` carries `channel_id` plus `target_user_id`
+        (member), role grant/revoke carry `target_id` (role) and
+        `target_user_id` (member), and guild actions and the reorder actions
+        carry neither.
+      required: [id, action, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        actor_id:
+          allOf:
+            - $ref: '#/components/schemas/Id'
+          nullable: true
+        action:
+          type: string
+          enum:
+            - guild_name_update
+            - guild_avatar_update
+            - guild_avatar_delete
+            - channel_create
+            - channel_name_update
+            - channel_topic_update
+            - channel_parent_update
+            - channel_delete
+            - channel_reorder
+            - role_overwrite_update
+            - member_overwrite_update
+            - role_create
+            - role_name_update
+            - role_permissions_update
+            - role_color_update
+            - role_mentionable_update
+            - role_delete
+            - role_reorder
+            - role_grant
+            - role_revoke
+            - emoji_create
+            - emoji_name_update
+            - emoji_icon_update
+            - emoji_delete
+            - webhook_create
+            - webhook_name_update
+            - webhook_avatar_update
+            - webhook_avatar_delete
+            - webhook_delete
+            - message_delete
+            - message_pin
+            - message_unpin
+        target_id:
+          allOf:
+            - $ref: '#/components/schemas/Id'
+          nullable: true
+        target_user_id:
+          allOf:
+            - $ref: '#/components/schemas/Id'
+          nullable: true
+        channel_id:
+          allOf:
+            - $ref: '#/components/schemas/Id'
+          nullable: true
+        created_at:
+          type: integer
+          description: Unix epoch milliseconds.
+    AllowedMentions:
+      type: object
+      description: >-
+        Controls which mentions parsed from the message content take effect. It
+        is validated against the presence of mentions in `content` (phantom ids
+        are silently ignored) and never rewrites the content. `parse` is
+        mutually exclusive with `users`/`roles`.
+      properties:
+        parse:
+          type: array
+          items:
+            type: string
+            enum: [users, roles, everyone]
+          description: >-
+            Mention kinds to parse; an empty array suppresses every mention.
+            Mutually exclusive with `users`/`roles`.
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            User ids allowed to be mentioned; at most
+            `api.messages.max_allowed_mention_users`. Disables all other kinds.
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            Role ids allowed to be mentioned; at most
+            `api.messages.max_allowed_mention_roles`. Disables all other kinds.
+    TokenResponse:
+      type: object
+      required: [access_token, expires_in]
+      properties:
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+          description: Access token lifetime, seconds
+    User:
+      type: object
+      properties:
+        username:
+          type: string
+          format: username
+        display_name:
+          type: string
+          format: display-name
+          nullable: true
+        avatar_hash:
+          type: string
+          pattern: '^[0-9a-f]{16}$'
+          nullable: true
+          readOnly: true
+          description: >-
+            XXHash64 of the stored webp avatar, 16 lowercase hex chars; null
+            when the user has no avatar. Fetch the image from
+            `GET /users/{user_id}/avatar?hash={avatar_hash}`.
+        is_bot:
+          type: boolean
+    UserWithId:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            id:
+              $ref: '#/components/schemas/Id'
+    Guild:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        name:
+          type: string
+          format: display-name
+        avatar_hash:
+          type: string
+          pattern: '^[0-9a-f]{16}$'
+          nullable: true
+          readOnly: true
+          description: >-
+            XXHash64 of the stored webp avatar, 16 lowercase hex chars; null
+            when the guild has no avatar. Fetch the image from
+            `GET /guilds/{guild_id}/avatar?hash={avatar_hash}`.
+    Emoji:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        name:
+          type: string
+          format: emoji-name
+          description: Unique within the guild.
+        icon_hash:
+          type: string
+          pattern: '^[0-9a-f]{16}$'
+          readOnly: true
+          description: >-
+            XXHash64 of the stored webp icon, 16 lowercase hex chars. Fetch the
+            image from `GET /emojis/{emoji_id}/icon?hash={icon_hash}`.
+    ReactionRequest:
+      type: object
+      description: >-
+        Exactly one of `emoji_id` / `unicode_emoji` must be present; the emoji
+        is identified by the two columns of `app.message_reactions`.
+      properties:
+        emoji_id:
+          $ref: '#/components/schemas/Id'
+        unicode_emoji:
+          type: string
+          description: >-
+            Exactly one fully-qualified RGI emoji sequence (raw UTF-8, not
+            percent-encoded).
+    ReactionSummary:
+      type: object
+      required: [count, me]
+      description: >-
+        Exactly one of `emoji_id` / `unicode_emoji` is set; `count` is the
+        number of non-deleted users who reacted with that emoji (equal to the
+        length of `GET /messages/{message_id}/reactions/users` for it) and `me`
+        is whether the caller did.
+      properties:
+        emoji_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        unicode_emoji:
+          type: string
+          nullable: true
+        count:
+          type: integer
+          format: int64
+        me:
+          type: boolean
+    ChannelKind:
+      type: string
+      enum: [channel, category]
+    Channel:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        parent_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        kind:
+          $ref: '#/components/schemas/ChannelKind'
+        name:
+          type: string
+          format: display-name
+        topic:
+          type: string
+          format: display-name
+          nullable: true
+        position:
+          type: integer
+          minimum: 0
+          maximum: 32767
+          description: >-
+            Read-only ordering within the channel's parent scope; change it
+            through PUT /guilds/{guild_id}/channels/order
+        last_message_id:
+          allOf:
+            - $ref: '#/components/schemas/Id'
+          nullable: true
+          description: >-
+            The id of the newest non-deleted message in the channel, or null
+            when the channel has no non-deleted messages.
+        permissions:
+          allOf:
+            - $ref: '#/components/schemas/PermissionBits'
+          description: >-
+            Read-only effective permissions of the requesting user on this
+            channel: the guild base permissions folded with the channel
+            overwrites (`@everyone` → the user's roles → the member overwrite),
+            honoring the caller's `skip_denies`/`skip_allows`. The value is the
+            exact mask the channel permission checks evaluate, so it includes
+            guild-level bits (`create_channels`, `create_roles`, ...) and the
+            skip bits. Returned by both GET /guilds/{guild_id}/channels and
+            GET /channels/{channel_id}.
+        overwrites:
+          type: array
+          items:
+            $ref: '#/components/schemas/Overwrite'
+          description: >-
+            Full permission-overwrite list of the channel, ordered by target
+            type then target id. An empty array when the channel has none.
+            Readable by any authenticated user. Mutation is still through
+            PUT /channels/{channel_id}/overwrites.
+    ChannelWithGuild:
+      allOf:
+        - $ref: '#/components/schemas/Channel'
+        - type: object
+          properties:
+            guild_id:
+              $ref: '#/components/schemas/Id'
+    EmbedField:
+      type: object
+      required: [name, value]
+      description: >-
+        A single embed field. `name` and `value` are required and follow the
+        message-text profile (NFKC-normalized, forbidden codepoints stripped)
+        bounded by `api.embeds.max_field_name_codepoints` and
+        `api.embeds.max_field_value_codepoints`.
+      properties:
+        name:
+          type: string
+        value:
+          type: string
+        inline:
+          type: boolean
+          default: false
+    EmbedFooter:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+        icon_url:
+          type: string
+          nullable: true
+    EmbedImage:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+    EmbedThumbnail:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+    EmbedVideo:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+    EmbedAuthor:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+          nullable: true
+        icon_url:
+          type: string
+          nullable: true
+    Embed:
+      type: object
+      description: >-
+        A rich embed. Validation is strict: when a sub-object is present its
+        required fields (`footer.text`, `author.name`,
+        `image`/`thumbnail`/`video.url`, `field.name`/`field.value`) must be
+        present too. Text fields are NFKC-normalized and message-text forbidden
+        codepoints are stripped; URLs are bounded by
+        `api.embeds.max_url_codepoints` and do not count towards
+        `api.embeds.max_total_codepoints`. At most `api.messages.max_embeds`
+        embeds are accepted per message.
+      properties:
+        type:
+          type: string
+          enum: [rich]
+          default: rich
+        title:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        url:
+          type: string
+          nullable: true
+        timestamp:
+          type: integer
+          format: int64
+          nullable: true
+          description: Unix epoch, milliseconds
+        color:
+          type: integer
+          minimum: 0
+          maximum: 16777215
+          nullable: true
+        footer:
+          allOf:
+            - $ref: '#/components/schemas/EmbedFooter'
+          nullable: true
+        image:
+          allOf:
+            - $ref: '#/components/schemas/EmbedImage'
+          nullable: true
+        thumbnail:
+          allOf:
+            - $ref: '#/components/schemas/EmbedThumbnail'
+          nullable: true
+        video:
+          allOf:
+            - $ref: '#/components/schemas/EmbedVideo'
+          nullable: true
+        author:
+          allOf:
+            - $ref: '#/components/schemas/EmbedAuthor'
+          nullable: true
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/EmbedField'
+    Message:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        channel_id:
+          $ref: '#/components/schemas/Id'
+          description: >-
+            Id of the channel the message belongs to. Always present, so a
+            client can locate the message regardless of which endpoint returned
+            it.
+        author_id:
+          $ref: '#/components/schemas/Id'
+          nullable: true
+          description: >-
+            Author user id; null for a webhook message (which carries
+            `webhook_id` instead). `author_id` and `webhook_id` are mutually
+            exclusive.
+        webhook_id:
+          $ref: '#/components/schemas/Id'
+          nullable: true
+          description: >-
+            Webhook id when the message was posted by a webhook; null for a user
+            message. Use `GET /api/webhooks/{webhook_id}` to resolve its
+            name/avatar.
+        content:
+          type: string
+          format: message-body
+          description: Sanitized message body (forbidden codepoints stripped on receipt)
+        created_at:
+          type: integer
+          format: int64
+          description: Unix epoch, milliseconds
+        reply_to_id:
+          $ref: '#/components/schemas/Id'
+          nullable: true
+        edited_at:
+          type: integer
+          format: int64
+          description: Unix epoch, milliseconds
+          nullable: true
+        embeds:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/Embed'
+          description: >-
+            Null (absent) when the message has no embeds. The server serializes
+            unset optional embed fields as explicit nulls and always emits
+            `fields` as an array.
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Attachment'
+          description: >-
+            Ordered attachments of the message; an empty array when there are
+            none.
+        mention_everyone:
+          type: boolean
+          description: >-
+            True when the content contains `@everyone`/`@here` and it was left
+            enabled by `allowed_mentions`.
+        mentions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            User ids mentioned in the content (`<@id>` / `<@!id>`), in
+            first-appearance order, deduplicated. Ids of missing or deleted
+            users are dropped.
+        mention_roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            Role ids mentioned in the content (`<@&id>`) that belong to the
+            message's guild, in first-appearance order, deduplicated.
+        pinned:
+          type: boolean
+          description: True when the message is pinned in its channel.
+        reactions:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/ReactionSummary'
+          description: >-
+            Inline aggregated reactions of the message, ordered by the first
+            time each emoji was used; null when the message has none. `me` is
+            caller-specific. Present on every message read (channel pages,
+            single-message read and search); the aggregate reaction endpoint no
+            longer exists.
+    MessageWithoutId:
+      type: object
+      properties:
+        channel_id:
+          $ref: '#/components/schemas/Id'
+          description: Id of the channel the message belongs to.
+        author_id:
+          $ref: '#/components/schemas/Id'
+          nullable: true
+          description: >-
+            Author user id; null for a webhook message (which carries
+            `webhook_id` instead). `author_id` and `webhook_id` are mutually
+            exclusive.
+        webhook_id:
+          $ref: '#/components/schemas/Id'
+          nullable: true
+          description: >-
+            Webhook id when the message was posted by a webhook; null for a user
+            message. Use `GET /api/webhooks/{webhook_id}` to resolve its
+            name/avatar.
+        content:
+          type: string
+          format: message-body
+          description: Sanitized message body (forbidden codepoints stripped on receipt)
+        created_at:
+          type: integer
+          format: int64
+          description: Unix epoch, milliseconds
+        reply_to_id:
+          $ref: '#/components/schemas/Id'
+          nullable: true
+        edited_at:
+          type: integer
+          format: int64
+          description: Unix epoch, milliseconds
+          nullable: true
+        embeds:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/Embed'
+          description: >-
+            Null (absent) when the message has no embeds. The server serializes
+            unset optional embed fields as explicit nulls and always emits
+            `fields` as an array.
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Attachment'
+          description: >-
+            Ordered attachments of the message; an empty array when there are
+            none.
+        mention_everyone:
+          type: boolean
+          description: >-
+            True when the content contains `@everyone`/`@here` and it was left
+            enabled by `allowed_mentions`.
+        mentions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            User ids mentioned in the content (`<@id>` / `<@!id>`), in
+            first-appearance order, deduplicated. Ids of missing or deleted
+            users are dropped.
+        mention_roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+          description: >-
+            Role ids mentioned in the content (`<@&id>`) that belong to the
+            message's guild, in first-appearance order, deduplicated.
+        pinned:
+          type: boolean
+          description: True when the message is pinned in its channel.
+        reactions:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/ReactionSummary'
+          description: >-
+            Inline aggregated reactions of the message, ordered by the first
+            time each emoji was used; null when the message has none. `me` is
+            caller-specific.
+    GuildMessageSearchResult:
+      type: object
+      required: [messages, total]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+          description: >-
+            The requested page of matching messages, ordered by `sort`. Each
+            item carries its `channel_id`.
+        total:
+          type: integer
+          format: int64
+          description: >-
+            Exact number of messages matching the filters, independent of
+            `offset`/`limit`.
+    Role:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        name:
+          type: string
+          format: display-name
+          description: >-
+            Max `api.roles.max_name_codepoints`; forbidden codepoints (Cc/Cf,
+            zero-width, BiDi, ...) are rejected on create/modify with 400
+            "'name' is invalid".
+        position:
+          type: integer
+          minimum: 0
+          maximum: 32767
+          description: >-
+            Read-only unique rank within the guild (@everyone is always 0);
+            change it through PUT /guilds/{guild_id}/roles/order
+        permissions:
+          $ref: '#/components/schemas/PermissionBits'
+        color:
+          type: integer
+          minimum: 0
+          maximum: 16777215
+          nullable: true
+        mentionable:
+          type: boolean
+          description: >-
+            Whether members may mention this role. Defaults to `true` on
+            creation; role mentions are gated by it (together with the
+            `mention_everyone` permission for `@everyone`).
+    RoleWithGuild:
+      allOf:
+        - $ref: '#/components/schemas/Role'
+        - type: object
+          properties:
+            guild_id:
+              $ref: '#/components/schemas/Id'
+    Overwrite:
+      type: object
+      properties:
+        target_id:
+          allOf:
+            - $ref: '#/components/schemas/Id'
+          description: role_id or user_id
+        type:
+          type: string
+          enum: [role, member]
+        allow:
+          $ref: '#/components/schemas/PermissionBits'
+        deny:
+          $ref: '#/components/schemas/PermissionBits'
+    Limits:
+      type: object
+      properties:
+        guilds:
+          type: object
+          properties:
+            max_name_codepoints: { type: integer }
+            max_emojis: { type: integer }
+        channels:
+          type: object
+          properties:
+            max_name_codepoints: { type: integer }
+            max_topic_codepoints: { type: integer }
+        messages:
+          type: object
+          properties:
+            max_messages_limit: { type: integer }
+            max_codepoints_per_message: { type: integer }
+            max_reactions: { type: integer }
+            max_reactions_users_limit: { type: integer }
+            max_embeds: { type: integer }
+            max_attachments: { type: integer }
+            max_mention_users: { type: integer }
+            max_mention_roles: { type: integer }
+            max_allowed_mention_users: { type: integer }
+            max_allowed_mention_roles: { type: integer }
+        search:
+          type: object
+          properties:
+            min_content_codepoints: { type: integer }
+            max_content_codepoints: { type: integer }
+            max_filter_ids: { type: integer }
+        sync:
+          type: object
+          properties:
+            max_lookback_s: { type: integer }
+        audit_log:
+          type: object
+          properties:
+            max_entries_limit: { type: integer }
+        embeds:
+          type: object
+          properties:
+            max_title_codepoints: { type: integer }
+            max_description_codepoints: { type: integer }
+            max_fields: { type: integer }
+            max_footer_codepoints: { type: integer }
+            max_author_name_codepoints: { type: integer }
+            max_field_name_codepoints: { type: integer }
+            max_field_value_codepoints: { type: integer }
+            max_url_codepoints: { type: integer }
+            max_total_codepoints: { type: integer }
+        roles:
+          type: object
+          properties:
+            max_name_codepoints: { type: integer }
+        emojis:
+          type: object
+          properties:
+            min_name_codepoints: { type: integer }
+            max_name_codepoints: { type: integer }
+        users:
+          type: object
+          properties:
+            min_username_codepoints: { type: integer }
+            max_username_codepoints: { type: integer }
+            min_display_name_codepoints: { type: integer }
+            max_display_name_codepoints: { type: integer }
+            max_userdata_bytes: { type: integer }
+        auth:
+          type: object
+          properties:
+            password:
+              type: object
+              properties:
+                min_codepoints: { type: integer }
+                max_codepoints: { type: integer }
+                max_bytes: { type: integer }
+        media:
+          type: object
+          properties:
+            avatar:
+              type: object
+              properties:
+                max_dimensions: { type: integer }
+                max_bytes: { type: integer }
+                max_animation_frames: { type: integer }
+                max_animation_duration_ms: { type: integer }
+            emoji:
+              type: object
+              properties:
+                max_dimensions: { type: integer }
+                max_bytes: { type: integer }
+                max_animation_frames: { type: integer }
+                max_animation_duration_ms: { type: integer }
+        files:
+          type: object
+          properties:
+            max_name_codepoints: { type: integer }
+            max_size: { type: integer }
+            whitelist:
+              type: array
+              nullable: true
+              description: >-
+                MIME patterns accepted by `POST /api/files`, mirroring
+                `files.whitelist`. `null` allows every type, an empty array
+                allows none. An exact `type/subtype` matches that type; a
+                `<type>/*` entry (e.g. `text/*`) matches any subtype of that type.
+              items:
+                type: string
+            public_base_urls:
+              type: array
+              description: >-
+                Origins from which files are served
+                (`files.s3.public_base_url`); empty when storage is disabled.
+                Use these to build a Content-Security-Policy `img-src` /
+                `media-src` allowlist. Served with the HTML document, not by the
+                API. Files are served cross-origin; the files origin/CDN should
+                add `X-Content-Type-Options: nosniff`, `Content-Security-Policy:
+                sandbox; default-src 'none'; frame-ancestors 'none'`,
+                `Cross-Origin-Resource-Policy: cross-origin` and
+                `Referrer-Policy: no-referrer`, since the stored `Content-Type`
+                of passthrough types is client-declared.
+              items:
+                type: string
+        push:
+          type: object
+          description: >-
+            Browser Web Push availability. When `enabled` is false the
+            subscription endpoints still store rows but no notification is
+            delivered. `vapid_public_key` is the base64url `applicationServerKey`
+            the client passes to `PushManager.subscribe`.
+          properties:
+            enabled: { type: boolean }
+            vapid_public_key: { type: string }
+            max_subscriptions_per_user: { type: integer }
+        webhooks:
+          type: object
+          properties:
+            max_webhooks_per_channel: { type: integer }
+            max_name_codepoints: { type: integer }
+    SyncCursor:
+      type: integer
+      description: >-
+        Server cursor: the database `now()` captured at query start, in epoch
+        milliseconds. Store it and pass it as the next `since`.
+    GuildSync:
+      type: object
+      required: [updated_at, channels, roles, emojis, overwrites, member_roles]
+      properties:
+        updated_at:
+          $ref: '#/components/schemas/SyncCursor'
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+        emojis:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+        overwrites:
+          type: array
+          items:
+            type: object
+            required: [channel_id, target_id, type]
+            properties:
+              channel_id:
+                $ref: '#/components/schemas/Id'
+              target_id:
+                $ref: '#/components/schemas/Id'
+              type:
+                type: string
+                enum: [role, member]
+        member_roles:
+          type: array
+          description: The caller's complete current role-id set in this guild.
+          items:
+            $ref: '#/components/schemas/Id'
+    MessagesSync:
+      type: object
+      required: [updated_at, messages]
+      properties:
+        updated_at:
+          $ref: '#/components/schemas/SyncCursor'
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+    UsersSync:
+      type: object
+      required: [updated_at, users]
+      properties:
+        updated_at:
+          $ref: '#/components/schemas/SyncCursor'
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'

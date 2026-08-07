@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  debian:
+    name: Debian 13
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: debian:13
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Bootstrap container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl xz-utils
+
+      - uses: actions/checkout@v5
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Install build dependencies
+        run: |
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            libpq-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+            libwebp-dev \
+            libcurl4-openssl-dev \
+            libsystemd-dev \
+            postgresql
+
+      - name: Build
+        run: zig build
+
+      - name: Zig unit tests
+        run: zig build test
+
+      - name: Configure PostgreSQL
+        run: |
+          service postgresql start
+
+          for _ in $(seq 1 30); do
+            if pg_isready -q; then
+              break
+            fi
+            sleep 1
+          done
+
+          pg_isready
+
+          su postgres -c "createuser --superuser admin"
+          su postgres -c "createdb --owner=admin distrans_test"
+
+          hba="$(su postgres -c "psql -tAc 'SHOW hba_file'")"
+          printf '%s\n' \
+            'local all all trust' \
+            'host all all 127.0.0.1/32 trust' \
+            'host all all ::1/128 trust' > "$hba"
+
+          service postgresql reload
+
+          psql "host=localhost dbname=distrans_test user=admin" -c 'select 1'
+
+      - name: Integration tests
+        run: |
+          nohup zig build run -- config.tests.json > /tmp/server.log 2>&1 &
+          server_pid=$!
+
+          ready=0
+
+          for _ in $(seq 1 120); do
+            if curl -fsS "http://[::1]:8080/api/limits" > /dev/null 2>&1; then
+              ready=1
+              break
+            fi
+
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "server exited during startup"
+              cat /tmp/server.log
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "server did not become ready in time"
+            cat /tmp/server.log
+            exit 1
+          fi
+
+          uv run --frozen pytest -q
+
+      - name: Server log
+        if: failure()
+        run: cat /tmp/server.log 2>/dev/null || true

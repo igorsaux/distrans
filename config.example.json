@@ -1,0 +1,231 @@
+{
+  "general": {
+    "worker_id": 1,
+    "max_peers": 1024,
+    "shutdown_timeout_s": 5,
+    "io_timeout_us": 16000,
+    "watchdog_interval_s": null
+  },
+  "socket": {
+    "bind": {
+      "type": "inet",
+      "host": "::1",
+      "port": "8080"
+    },
+    "downlink_buf_size": 16384,
+    "uplink_buf_size": 16384,
+    "disconnect_timeout_ms": 500
+  },
+  "http": {
+    "max_path_size": 2048,
+    "max_headers": 24,
+    "max_query_params": 16,
+    "max_cookies": 16,
+    "read_timeout_ms": 1000,
+    "write_timeout_ms": 1000,
+    "host": null,
+    "arenas_reset_interval_s": null
+  },
+  "db": {
+    "conninfo": "host=localhost dbname=distrans user=admin",
+    "pool": 10
+  },
+  "api": {
+    "guilds": {
+      "max_name_codepoints": 18,
+      "max_emojis": 100
+    },
+    "messages": {
+      "max_messages_limit": 100,
+      "max_codepoints": 4096,
+      "max_reactions": 20,
+      "max_reactions_users_limit": 100,
+      "max_embeds": 10,
+      "max_attachments": 10,
+      "max_mention_users": 100,
+      "max_mention_roles": 100,
+      "max_allowed_mention_users": 100,
+      "max_allowed_mention_roles": 100
+    },
+    "search": {
+      "min_content_codepoints": 2,
+      "max_content_codepoints": 100,
+      "max_filter_ids": 50
+    },
+    "sync": {
+      "max_lookback_s": 604800
+    },
+    "audit_log": {
+      "max_entries_limit": 100
+    },
+    "embeds": {
+      "max_title_codepoints": 256,
+      "max_description_codepoints": 4096,
+      "max_fields": 25,
+      "max_footer_codepoints": 2048,
+      "max_author_name_codepoints": 256,
+      "max_field_name_codepoints": 256,
+      "max_field_value_codepoints": 1024,
+      "max_url_codepoints": 2048,
+      "max_total_codepoints": 6000
+    },
+    "users": {
+      "max_users_limit": 100,
+      "min_username_codepoints": 2,
+      "max_username_codepoints": 32,
+      "min_display_name_codepoints": 1,
+      "max_display_name_codepoints": 32,
+      "max_userdata_bytes": 524288
+    },
+    "roles": {
+      "max_name_codepoints": 24
+    },
+    "channels": {
+      "max_name_codepoints": 24,
+      "max_topic_codepoints": 128
+    },
+    "emojis": {
+      "max_emojis_limit": 100,
+      "min_name_codepoints": 2,
+      "max_name_codepoints": 32
+    },
+    "files": {
+      "max_name_codepoints": 256
+    },
+    "push": {
+      "max_subscriptions_per_user": 10,
+      "max_endpoint_bytes": 2048
+    },
+    "webhooks": {
+      "max_webhooks_per_channel": 10,
+      "max_name_codepoints": 64
+    },
+    "github": {
+      "max_body_bytes": 1048576,
+      "max_title_codepoints": 70,
+      "max_push_title_codepoints": 256,
+      "max_description_codepoints": 350,
+      "max_commits": 100
+    }
+  },
+  "auth": {
+    "password": {
+      "iterations": 2,
+      "memory_kib": 19456,
+      "parallelism": 1,
+      "min_password_codepoints": 8,
+      "max_password_codepoints": 64,
+      "max_password_len": 128
+    },
+    "access_token_exp_s": 900,
+    "access_token_key": "CHANGE_ME",
+    "refresh_token_exp_s": 432000
+  },
+  "system": {
+    "token": "CHANGE_ME"
+  },
+  "services": {
+    "pwhash": {
+      "max_jobs": 16
+    },
+    "media": {
+      "max_jobs": 4
+    },
+    "files": {
+      "max_jobs": 4
+    },
+    "notifications": {
+      "max_concurrent": 16,
+      "queue_capacity": 64,
+      "max_recipients": 1000
+    }
+  },
+  "websocket": {
+    "auth_timeout_ms": 5000,
+    "min_heartbeat_ms": 40000,
+    "max_heartbeat_ms": 45000,
+    "heartbeat_threshold_ms": 3000
+  },
+  "media": {
+    "avatar": {
+      "lossless": false,
+      "quality": 75,
+      "compression_level": 4,
+      "max_dimensions": 512,
+      "max_input_bytes": 2097152,
+      "max_output_bytes": 2097152,
+      "max_animation_frames": 128,
+      "max_animation_duration_ms": 10000,
+      "min_animation_frame_delay_ms": 20,
+      "max_animation_frame_delay_ms": 2000
+    },
+    "emoji": {
+      "lossless": true,
+      "quality": 75,
+      "compression_level": 4,
+      "max_dimensions": 64,
+      "max_input_bytes": 1048576,
+      "max_output_bytes": 1048576,
+      "max_animation_frames": 128,
+      "max_animation_duration_ms": 5000,
+      "min_animation_frame_delay_ms": 20,
+      "max_animation_frame_delay_ms": 1000
+    },
+    "files": {
+      "lossless": false,
+      "quality": 75,
+      "compression_level": 4,
+      "max_dimensions": 2048,
+      "max_input_bytes": 4194304,
+      "max_output_bytes": 4194304,
+      "max_animation_frames": 128,
+      "max_animation_duration_ms": 10000,
+      "min_animation_frame_delay_ms": 20,
+      "max_animation_frame_delay_ms": 2000
+    }
+  },
+  "files": {
+    "type": "s3",
+    "s3": {
+      "endpoint": "https://s3.local",
+      "public_base_url": "https://s3-public.local",
+      "region": "ru-6",
+      "access_key": "CHANGE_ME",
+      "secret_key": "CHANGE_ME"
+    },
+    "max_size": 4194304,
+    "whitelist": [
+      "image/webp",
+      "image/gif",
+      "image/png",
+      "image/jpeg",
+      "image/jpg",
+      "text/*",
+      "audio/*",
+      "application/zip",
+      "application/x-zip-compressed",
+      "application/x-7z-compressed",
+      "application/x-rar-compressed",
+      "application/x-tar",
+      "application/gzip",
+      "application/x-gzip",
+      "application/x-bzip2",
+      "application/x-xz",
+      "application/octet-stream"
+    ],
+    "gc": {
+      "interval_s": 1800,
+      "grace_s": 600
+    }
+  },
+  "push": {
+    "enabled": false,
+    "vapid": {
+      "subject": "mailto:admin@example.com",
+      "public_key": "CHANGE_ME",
+      "private_key": "CHANGE_ME"
+    },
+    "ttl_s": 86400,
+    "max_preview_codepoints": 120
+  }
+}
