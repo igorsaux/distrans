@@ -3489,13 +3489,21 @@ paths:
         (attribution uses the webhook's configured `name`/avatar). No signature verification
         (`X-Hub-Signature*` is ignored) and no delivery deduplication: the URL
         token is the capability, exactly like `POST /webhooks/{webhook_id}/{token}`.
-        Supported events: `commit_comment`, `create`, `delete`, `fork`,
-        `issue_comment`, `issues`, `member`, `public`, `pull_request`,
-        `pull_request_review`, `pull_request_review_comment`, `push`, `release`,
-        `watch`, `check_run`, `check_suite`, `discussion`,
-        `discussion_comment`, `repository`. Any other event (including `ping`)
-        and unsupported actions answer 204 without posting. Success is always
-        204; there is no `wait`.
+        Supported event/action combinations are `commit_comment/created`,
+        `create` (branch/tag), `delete` (branch/tag), `fork`,
+        `issue_comment/created`, `issues` (opened/closed/reopened), `member/added`,
+        `public`, `pull_request` (opened/closed/reopened),
+        `pull_request_review/submitted`,
+        `pull_request_review_comment/created`, `push`, `release/published`,
+        `watch/started`, `star` (created/deleted), `check_run/completed`,
+        `check_suite/completed`, `discussion/created`,
+        `discussion_comment/created`, and `repository/created`. For a supported
+        combination with a valid payload, the endpoint creates one message.
+        For an unsupported event, unsupported action, or incomplete payload, it
+        creates no message and still responds with `204 No Content`. GitHub's
+        `ping` event is a setup verification delivery; it is acknowledged with
+        `204 No Content` and does not create a chat message. Deliveries are not
+        deduplicated, so a redelivery can create another message.
       operationId: executeGitHubWebhook
       security: []
       parameters:
@@ -3535,8 +3543,10 @@ paths:
       responses:
         '204':
           description: >-
-            Accepted: the event was rendered and posted, or intentionally
-            ignored (unsupported event/action).
+            The delivery was accepted. A chat message is created only for a
+            supported event/action combination with a valid payload; otherwise
+            no message is created. This includes GitHub's setup-verification
+            `ping` event.
         '400':
           description: Missing `X-GitHub-Event`, empty body, or bad JSON payload
           content:

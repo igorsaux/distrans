@@ -7,15 +7,8 @@ const root = @import("../root.zig");
 
 const SCOPE = std.log.scoped(.github);
 
-/// Renders a GitHub webhook delivery into one rich embed.
-/// `null` means the event (or its action) is not rendered
-/// (the caller then answers 204 without posting a message).
-///
-/// Only these events are supported: `commit_comment`, `create`, `delete`,
-/// `fork`, `issue_comment`, `issues`, `member`, `public`, `pull_request`,
-/// `pull_request_review`, `pull_request_review_comment`, `push`, `release`,
-/// `watch`, `check_run`, `check_suite`, `discussion`, `discussion_comment`,
-/// `repository`. Everything else (including `ping`) yields `null`.
+/// Renders supported GitHub event/action combinations into rich embeds.
+/// Unknown events, unsupported actions, or incomplete event data yield `null`.
 pub fn transform(
     allocator: std.mem.Allocator,
     event: []const u8,
@@ -55,6 +48,8 @@ pub fn transform(
         return try transformRelease(allocator, object);
     } else if (std.mem.eql(u8, event, "watch")) {
         return try transformWatch(allocator, object);
+    } else if (std.mem.eql(u8, event, "star")) {
+        return try transformStar(allocator, object);
     } else if (std.mem.eql(u8, event, "check_run")) {
         return try transformCheckRun(allocator, object);
     } else if (std.mem.eql(u8, event, "check_suite")) {
@@ -300,7 +295,7 @@ inline fn transformIssueComment(allocator: std.mem.Allocator, object: std.json.O
     const issue_title = getString(issue, "title") orelse return null;
     const user = getObject(comment, "user") orelse return null;
 
-    const kind: []const u8 = if (object.get("pull_request") != null) "pull request" else "issue";
+    const kind: []const u8 = if (issue.get("pull_request") != null) "pull request" else "issue";
 
     return .{
         .title = try text(allocator, try std.fmt.allocPrint(
@@ -643,9 +638,28 @@ inline fn transformWatch(allocator: std.mem.Allocator, object: std.json.ObjectMa
     return .{
         .title = try text(allocator, try std.fmt.allocPrint(
             allocator,
-            "[{s}] New star added",
+            "[{s}] New repository watcher",
             .{full_name},
         ), root.options.api.github.max_title_codepoints),
+        .url = getString(repository, "html_url"),
+        .author = try senderAuthor(allocator, object),
+    };
+}
+
+inline fn transformStar(allocator: std.mem.Allocator, object: std.json.ObjectMap) !?root.types.Embed {
+    const action = getString(object, "action") orelse return null;
+    const repository = getObject(object, "repository") orelse return null;
+    const full_name = getString(repository, "full_name") orelse return null;
+
+    const verb = if (std.mem.eql(u8, action, "created"))
+        "New star added"
+    else if (std.mem.eql(u8, action, "deleted"))
+        "Star removed"
+    else
+        return null;
+
+    return .{
+        .title = try text(allocator, try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ full_name, verb }), root.options.api.github.max_title_codepoints),
         .url = getString(repository, "html_url"),
         .author = try senderAuthor(allocator, object),
     };

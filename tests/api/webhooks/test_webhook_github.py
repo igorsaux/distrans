@@ -15,6 +15,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tests/api
 
 from webhooks_common import (  # noqa: E402
@@ -279,6 +281,60 @@ def test_github_issue_opened(http_client, test_guild, test_channel, test_session
     assert embed["description"] == "It is broken"
 
 
+@pytest.mark.parametrize("action,title", [("created", "New star added"), ("deleted", "Star removed")])
+def test_github_star_actions(http_client, test_guild, test_channel, test_session, action, title):
+    created = create_hook(http_client, test_guild, test_channel)
+    payload = {
+        "action": action,
+        "repository": repo(),
+        "sender": sender(),
+        "starred_at": "2026-10-15T07:01:44Z" if action == "created" else None,
+    }
+
+    response = execute_github(http_client, created["id"], created["token"], "star", payload)
+
+    assert response.status_code == 204
+    messages = get_messages(http_client, test_session.access_token, test_channel.id)
+    assert messages[0]["embeds"][0]["title"] == f"[octocat/distrans] {title}"
+
+
+def test_github_watch_is_not_rendered_as_star(http_client, test_guild, test_channel, test_session):
+    created = create_hook(http_client, test_guild, test_channel)
+    payload = {"action": "started", "repository": repo(), "sender": sender()}
+
+    response = execute_github(http_client, created["id"], created["token"], "watch", payload)
+
+    assert response.status_code == 204
+    embed = get_messages(http_client, test_session.access_token, test_channel.id)[0]["embeds"][0]
+    assert embed["title"] == "[octocat/distrans] New repository watcher"
+
+
+def test_github_issue_comment_identifies_pull_request(http_client, test_guild, test_channel, test_session):
+    created = create_hook(http_client, test_guild, test_channel)
+    payload = {
+        "action": "created",
+        "repository": repo(),
+        "sender": sender(),
+        "issue": {
+            "number": 7,
+            "title": "Improve the thing",
+            "html_url": "https://github.com/octocat/distrans/pull/7",
+            "pull_request": {"url": "https://api.github.com/repos/octocat/distrans/pulls/7"},
+        },
+        "comment": {
+            "body": "Looks good",
+            "html_url": "https://github.com/octocat/distrans/pull/7#issuecomment-1",
+            "user": sender(),
+        },
+    }
+
+    response = execute_github(http_client, created["id"], created["token"], "issue_comment", payload)
+
+    assert response.status_code == 204
+    embed = get_messages(http_client, test_session.access_token, test_channel.id)[0]["embeds"][0]
+    assert embed["title"] == "[octocat/distrans] New comment on pull request #7: Improve the thing"
+
+
 # R5 - a ping posts nothing
 def test_github_ping_ignored(http_client, test_guild, test_channel, test_session):
     created = create_hook(http_client, test_guild, test_channel)
@@ -296,7 +352,7 @@ def test_github_unsupported_event(http_client, test_guild, test_channel, test_se
     created = create_hook(http_client, test_guild, test_channel)
 
     response = execute_github(
-        http_client, created["id"], created["token"], "workflow_run", {"action": "completed"}
+        http_client, created["id"], created["token"], "future_event", {"action": "created"}
     )
 
     assert response.status_code == 204
