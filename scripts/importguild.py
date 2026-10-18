@@ -59,7 +59,12 @@ WHAT IS TRANSFERRED
       id, name, parent_id, position, topic
     * overwrites: role/member targets with remapped allow/deny
     * member_roles: role assignments from members.jsonl (minus @everyone)
-    * messages: id, channel_id, author_id, content, created_at, edited_at, embeds
+    * messages: id, channel_id, author_id, content, created_at, edited_at, embeds.
+      `updated_at` is the changed-since cursor for `/messages/sync`, so it is set
+      to the dump's own last-change time (`edited_at`, else `created_at`) rather
+      than to the import time: a bulk backfill must not present every historical
+      message as freshly changed, or the first sync of a large channel returns
+      the whole history in one body
     * pinned messages: the dump's `pinned` flag becomes `app.messages.pinned`
       (a boolean; the dump carries no pin timestamp). On a re-run pins are
       backfilled fill-only: a pin the dump has but the DB lacks is added, while
@@ -2066,9 +2071,9 @@ def import_message_file(
 def flush_messages(cur, report):
     cur.execute(
         "INSERT INTO app.messages"
-        " (id, channel_id, guild_id, author_id, webhook_id, content, created_at, edited_at, embeds, pinned)"
+        " (id, channel_id, guild_id, author_id, webhook_id, content, created_at, edited_at, updated_at, embeds, pinned)"
         " SELECT i.id, i.channel_id, c.guild_id, i.author_id, i.webhook_id, i.content, i.created_at,"
-        "        i.edited_at, i.embeds, COALESCE(i.pinned, false)"
+        "        i.edited_at, COALESCE(i.edited_at, i.created_at), i.embeds, COALESCE(i.pinned, false)"
         " FROM import_messages i"
         " JOIN app.channels c ON c.id = i.channel_id"
         " WHERE NOT EXISTS (SELECT 1 FROM app.messages m WHERE m.id = i.id)"

@@ -136,6 +136,41 @@ def test_mismatched_existing_id_hash_is_not_reused_or_uploaded():
     assert "different bytes" in counters["warnings"][0]
 
 
+def test_import_preserves_dump_message_updated_at():
+    """An imported message must not look freshly changed to `/messages/sync`."""
+
+    class Cursor:
+        rowcount = 0
+
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, query, *_):
+            self.queries.append(query)
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return (0,)
+
+    cur = Cursor()
+    counters = {
+        "messages_inserted": 0,
+        "messages_webhook": 0,
+        "messages_pinned": 0,
+        "embeds_inserted": 0,
+        "replies_linked": 0,
+        "replies_dropped": 0,
+    }
+
+    importguild.flush_messages(cur, counters)
+
+    insert = next(query for query in cur.queries if query.startswith("INSERT INTO app.messages"))
+    assert "updated_at" in insert
+    assert "COALESCE(i.edited_at, i.created_at)" in insert
+
+
 def test_reaction_emoji_canonicalized_to_fully_qualified():
     canonical = importguild.load_emoji_canonical()
 
