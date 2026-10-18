@@ -1,7 +1,7 @@
 openapi: '3.0.3'
 info:
   title: Distrans
-  version: '1.0'
+  version: '1.0.0'
   license:
     name: Apache-2.0
     url: https://spdx.org/licenses/Apache-2.0.html
@@ -75,11 +75,41 @@ info:
         codepoints. Uniqueness is per guild.
 servers:
   - url: https://localhost/api
+tags:
+  - name: meta
+    description: Limits, terms of service and privacy policy.
+  - name: auth
+    description: Password login, refresh and logout.
+  - name: users
+    description: Users, profiles, avatars and userdata.
+  - name: guilds
+    description: Guilds, guild avatars and the audit log.
+  - name: channels
+    description: Channels, categories, ordering and overwrites.
+  - name: messages
+    description: Messages, pins and message search.
+  - name: roles
+    description: Role management, ordering and member assignments.
+  - name: emojis
+    description: Custom emoji management and icons.
+  - name: webhooks
+    description: Webhook management and execution.
+  - name: files
+    description: File uploads.
+  - name: notifications
+    description: Guild/channel notification settings and push subscriptions.
+  - name: sync
+    description: Incremental sync cursors.
+  - name: system
+    description: System-administration endpoints (system token).
+  - name: gateway
+    description: WebSocket gateway upgrade endpoint.
 paths:
   /limits:
     get:
       summary: Get API limits
       description: Public endpoint, no authentication required.
+      tags: [meta]
       operationId: getLimits
       security: []
       responses:
@@ -95,6 +125,7 @@ paths:
       description: >-
         Public endpoint, no authentication required. Returns the Terms of Service
         as a Markdown document (`text/markdown`).
+      tags: [meta]
       operationId: getTerms
       security: []
       responses:
@@ -110,6 +141,7 @@ paths:
       description: >-
         Public endpoint, no authentication required. Returns the Privacy Policy
         as a Markdown document (`text/markdown`).
+      tags: [meta]
       operationId: getPrivacy
       security: []
       responses:
@@ -153,6 +185,7 @@ paths:
         therefore temporary. Responds `201 Created` when a new file row is
         inserted, or `200 OK` when the same bytes already exist and the row is
         reused.
+      tags: [files]
       operationId: postFile
       security:
         - bearerAuth: []
@@ -229,6 +262,7 @@ paths:
         afterwards the client sends `{"op":"ack"}` every `heartbeat_interval` ms;
         the server sends dispatch events carrying a `seq`. The server closes the
         connection if no ack arrives within the threshold.
+      tags: [gateway]
       operationId: getGateway
       security: []
       responses:
@@ -239,6 +273,7 @@ paths:
   /auth/token:
     post:
       summary: Issue an access token (password grant)
+      tags: [auth]
       operationId: postAuthToken
       security: []
       requestBody:
@@ -283,6 +318,7 @@ paths:
     post:
       summary: Rotate the refresh token and issue a new access token
       description: Requires the `refresh_token` cookie. The old token is revoked and replaced.
+      tags: [auth]
       operationId: postAuthTokenRefresh
       security:
         - refreshCookie: []
@@ -314,6 +350,7 @@ paths:
     post:
       summary: Revoke the refresh token (logout)
       description: Requires the `refresh_token` cookie. Revokes the token and clears the cookie.
+      tags: [auth]
       operationId: postAuthTokenLogout
       security:
         - refreshCookie: []
@@ -340,6 +377,7 @@ paths:
   /users:
     get:
       summary: List users (keyset pagination)
+      tags: [users]
       operationId: getUsers
       security:
         - bearerAuth: []
@@ -370,6 +408,7 @@ paths:
   /users/sync:
     get:
       summary: Changed users since a cursor
+      tags: [sync]
       operationId: getUsersSync
       security:
         - bearerAuth: []
@@ -394,6 +433,7 @@ paths:
   /users/@me:
     get:
       summary: Get the current user
+      tags: [users]
       operationId: getMe
       security:
         - bearerAuth: []
@@ -408,6 +448,7 @@ paths:
           $ref: '#/components/responses/Unauthorized'
     patch:
       summary: Update the current user
+      tags: [users]
       operationId: patchMe
       security:
         - bearerAuth: []
@@ -499,32 +540,21 @@ paths:
         chars). The body must be non-empty.
         Use `DELETE` to clear the avatar; a PUT never clears it.
         Every successful change dispatches a `user_updated` gateway event.
+      tags: [users]
       operationId: putMeAvatar
       security:
         - bearerAuth: []
       requestBody:
         required: true
         content:
-          image/webp:
+          application/octet-stream:
             schema:
               type: string
               format: binary
-          image/gif:
-            schema:
-              type: string
-              format: binary
-          image/png:
-            schema:
-              type: string
-              format: binary
-          image/jpeg:
-            schema:
-              type: string
-              format: binary
-          image/jpg:
-            schema:
-              type: string
-              format: binary
+        description: >-
+          Raw image bytes. The request `Content-Type` must be `image/webp`,
+          `image/gif`, `image/png`, `image/jpeg` or `image/jpg`; any other
+          type is rejected with 415.
       responses:
         '200':
           description: Avatar stored
@@ -564,6 +594,7 @@ paths:
       description: >-
         Removes the stored avatar. Idempotent: clearing an account that has no
         avatar is still 204. Dispatches a `user_updated` gateway event.
+      tags: [users]
       operationId: deleteMeAvatar
       security:
         - bearerAuth: []
@@ -575,6 +606,7 @@ paths:
   /users/@me/userdata:
     get:
       summary: Get the current user's userdata
+      tags: [users]
       operationId: getMeUserdata
       security:
         - bearerAuth: []
@@ -607,6 +639,7 @@ paths:
           $ref: '#/components/responses/Unauthorized'
     put:
       summary: Replace the current user's userdata
+      tags: [users]
       operationId: putMeUserdata
       security:
         - bearerAuth: []
@@ -659,6 +692,7 @@ paths:
       - $ref: '#/components/parameters/GuildId'
     get:
       summary: Get the current user's guild notification settings
+      tags: [notifications]
       operationId: getMeGuildNotifications
       security:
         - bearerAuth: []
@@ -690,6 +724,7 @@ paths:
                 $ref: '#/components/schemas/Error'
     patch:
       summary: Update the current user's guild notification settings
+      tags: [notifications]
       operationId: patchMeGuildNotifications
       security:
         - bearerAuth: []
@@ -741,6 +776,7 @@ paths:
       - $ref: '#/components/parameters/ChannelId'
     get:
       summary: Get the current user's channel notification settings
+      tags: [notifications]
       operationId: getMeChannelNotifications
       security:
         - bearerAuth: []
@@ -775,6 +811,7 @@ paths:
                 $ref: '#/components/schemas/Error'
     patch:
       summary: Update the current user's channel notification settings
+      tags: [notifications]
       operationId: patchMeChannelNotifications
       security:
         - bearerAuth: []
@@ -818,6 +855,7 @@ paths:
   /users/@me/push-subscriptions:
     get:
       summary: List the current user's push subscriptions
+      tags: [notifications]
       operationId: listMePushSubscriptions
       security:
         - bearerAuth: []
@@ -838,6 +876,7 @@ paths:
           $ref: '#/components/responses/Unauthorized'
     post:
       summary: Register a push subscription
+      tags: [notifications]
       operationId: createMePushSubscription
       security:
         - bearerAuth: []
@@ -893,6 +932,7 @@ paths:
       - $ref: '#/components/parameters/PushSubscriptionId'
     delete:
       summary: Delete a push subscription
+      tags: [notifications]
       operationId: deleteMePushSubscription
       security:
         - bearerAuth: []
@@ -926,6 +966,7 @@ paths:
         (or animated webp) avatar. The `hash` query parameter is required and
         must equal the user's current `avatar_hash`, otherwise 404. The response
         is immutable for a given hash, so it is safe to cache.
+      tags: [users]
       operationId: getUserAvatar
       security: []
       parameters:
@@ -939,7 +980,7 @@ paths:
         '200':
           description: OK
           content:
-            image/webp:
+            application/octet-stream:
               schema:
                 type: string
                 format: binary
@@ -954,6 +995,7 @@ paths:
       - $ref: '#/components/parameters/UserId'
     get:
       summary: Get a user
+      tags: [users]
       operationId: getUser
       security:
         - bearerAuth: []
@@ -981,6 +1023,7 @@ paths:
   /guilds:
     get:
       summary: List guilds
+      tags: [guilds]
       operationId: getGuilds
       security:
         - bearerAuth: []
@@ -1004,6 +1047,7 @@ paths:
         Requires `guild_modify` on the guild. Only `name` can be changed. A
         body without a recognized field (e.g. `{}`) is 400 "Nothing to update".
         Dispatches a `guild_updated` gateway event on success.
+      tags: [guilds]
       operationId: patchGuild
       security:
         - bearerAuth: []
@@ -1044,6 +1088,7 @@ paths:
       - $ref: '#/components/parameters/GuildId'
     get:
       summary: Changed guild entities since a cursor
+      tags: [sync]
       operationId: getGuildSync
       security:
         - bearerAuth: []
@@ -1086,6 +1131,7 @@ paths:
         (or animated webp) avatar. The `hash` query parameter is required and
         must equal the guild's current `avatar_hash`, otherwise 404. The
         response is immutable for a given hash, so it is safe to cache.
+      tags: [guilds]
       operationId: getGuildAvatar
       security: []
       parameters:
@@ -1099,7 +1145,7 @@ paths:
         '200':
           description: OK
           content:
-            image/webp:
+            application/octet-stream:
               schema:
                 type: string
                 format: binary
@@ -1125,32 +1171,21 @@ paths:
         non-empty.
         Use `DELETE` to clear the avatar; a PUT never clears it.
         Every successful change dispatches a `guild_updated` gateway event.
+      tags: [guilds]
       operationId: putGuildAvatar
       security:
         - bearerAuth: []
       requestBody:
         required: true
         content:
-          image/webp:
+          application/octet-stream:
             schema:
               type: string
               format: binary
-          image/gif:
-            schema:
-              type: string
-              format: binary
-          image/png:
-            schema:
-              type: string
-              format: binary
-          image/jpeg:
-            schema:
-              type: string
-              format: binary
-          image/jpg:
-            schema:
-              type: string
-              format: binary
+        description: >-
+          Raw image bytes. The request `Content-Type` must be `image/webp`,
+          `image/gif`, `image/png`, `image/jpeg` or `image/jpg`; any other
+          type is rejected with 415.
       responses:
         '200':
           description: Avatar stored
@@ -1203,6 +1238,7 @@ paths:
         Requires `guild_modify` on the guild. Removes the stored avatar.
         Idempotent: clearing a guild that has no avatar is still 204.
         Dispatches a `guild_updated` gateway event.
+      tags: [guilds]
       operationId: deleteGuildAvatar
       security:
         - bearerAuth: []
@@ -1232,6 +1268,7 @@ paths:
         Requires authentication (any logged-in user). Keyset-paginated by emoji
         `id` (ascending); `after` continues past an id. Only this guild's emojis
         are returned.
+      tags: [emojis]
       operationId: getGuildEmojis
       security:
         - bearerAuth: []
@@ -1286,6 +1323,7 @@ paths:
         re-encoded to WebP (animations to animated WebP) and stored. The guild
         may hold at most `api.guilds.max_emojis` emojis. Names are unique per
         guild. Dispatches an `emoji_created` gateway event.
+      tags: [emojis]
       operationId: postGuildEmoji
       security:
         - bearerAuth: []
@@ -1299,26 +1337,14 @@ paths:
       requestBody:
         required: true
         content:
-          image/webp:
+          application/octet-stream:
             schema:
               type: string
               format: binary
-          image/gif:
-            schema:
-              type: string
-              format: binary
-          image/png:
-            schema:
-              type: string
-              format: binary
-          image/jpeg:
-            schema:
-              type: string
-              format: binary
-          image/jpg:
-            schema:
-              type: string
-              format: binary
+        description: >-
+          Raw image bytes. The request `Content-Type` must be `image/webp`,
+          `image/gif`, `image/png`, `image/jpeg` or `image/jpg`; any other
+          type is rejected with 415.
       responses:
         '201':
           description: Created
@@ -1377,6 +1403,7 @@ paths:
         with a single `name` field; the name is not nullable. A duplicate name
         in the same guild is rejected. Dispatches an `emoji_updated` gateway
         event.
+      tags: [emojis]
       operationId: patchEmoji
       security:
         - bearerAuth: []
@@ -1424,6 +1451,7 @@ paths:
         Requires `delete_emoji` on the emoji's guild. Deleting an unknown (or
         already deleted) emoji is 404. Dispatches an `emoji_deleted` gateway
         event.
+      tags: [emojis]
       operationId: deleteEmoji
       security:
         - bearerAuth: []
@@ -1454,6 +1482,7 @@ paths:
         animated webp) icon. The `hash` query parameter is required and must
         equal the emoji's current `icon_hash`, otherwise 404. The response is
         immutable for a given hash, so it is safe to cache.
+      tags: [emojis]
       operationId: getEmojiIcon
       security: []
       parameters:
@@ -1467,7 +1496,7 @@ paths:
         '200':
           description: OK
           content:
-            image/webp:
+            application/octet-stream:
               schema:
                 type: string
                 format: binary
@@ -1491,32 +1520,21 @@ paths:
         so the client can fetch the image from
         `GET /emojis/{emoji_id}/icon?hash={icon_hash}`. Dispatches an
         `emoji_updated` gateway event.
+      tags: [emojis]
       operationId: updateEmojiIcon
       security:
         - bearerAuth: []
       requestBody:
         required: true
         content:
-          image/webp:
+          application/octet-stream:
             schema:
               type: string
               format: binary
-          image/gif:
-            schema:
-              type: string
-              format: binary
-          image/png:
-            schema:
-              type: string
-              format: binary
-          image/jpeg:
-            schema:
-              type: string
-              format: binary
-          image/jpg:
-            schema:
-              type: string
-              format: binary
+        description: >-
+          Raw image bytes. The request `Content-Type` must be `image/webp`,
+          `image/gif`, `image/png`, `image/jpeg` or `image/jpg`; any other
+          type is rejected with 415.
       responses:
         '200':
           description: OK
@@ -1570,6 +1588,7 @@ paths:
       - $ref: '#/components/parameters/GuildId'
     get:
       summary: List guild channels (full objects)
+      tags: [channels]
       operationId: getGuildChannels
       security:
         - bearerAuth: []
@@ -1592,6 +1611,7 @@ paths:
                 $ref: '#/components/schemas/Error'
     post:
       summary: Create a channel
+      tags: [channels]
       operationId: postGuildChannel
       security:
         - bearerAuth: []
@@ -1625,6 +1645,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [id]
                 properties:
                   id:
                     $ref: '#/components/schemas/Id'
@@ -1666,6 +1687,7 @@ paths:
         On success the server emits a `channels_reordered` gateway event
         carrying only `guild_id`; clients refetch
         `GET /guilds/{guild_id}/channels`.
+      tags: [channels]
       operationId: putGuildChannelsOrder
       security:
         - bearerAuth: []
@@ -1721,6 +1743,7 @@ paths:
         first by default, oldest first when requested) and paginated with
         `offset`/`limit`; `total` is the exact number of matches and does not
         depend on the requested page.
+      tags: [messages]
       operationId: searchGuildMessages
       security:
         - bearerAuth: []
@@ -1851,6 +1874,7 @@ paths:
         ordered by `sort` (newest first by default) and paginated with
         `offset`/`limit`; `total` is the exact number of matches and does not
         depend on the requested page.
+      tags: [guilds]
       operationId: getGuildAuditLog
       security:
         - bearerAuth: []
@@ -1936,6 +1960,7 @@ paths:
       - $ref: '#/components/parameters/GuildId'
     get:
       summary: List guild roles (full objects)
+      tags: [roles]
       operationId: getGuildRoles
       security:
         - bearerAuth: []
@@ -1965,6 +1990,7 @@ paths:
         bottom (position 1, shifting every other non-`@everyone` role up); the
         response carries only its id. Ordering is changed only through
         `PUT /guilds/{guild_id}/roles/order`.
+      tags: [roles]
       operationId: postGuildRoles
       security:
         - bearerAuth: []
@@ -2001,6 +2027,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [id]
                 properties:
                   id:
                     $ref: '#/components/schemas/Id'
@@ -2042,6 +2069,7 @@ paths:
 
         On success the server emits a `roles_reordered` gateway event carrying
         only `guild_id`; clients refetch `GET /guilds/{guild_id}/roles`.
+      tags: [roles]
       operationId: putGuildRolesOrder
       security:
         - bearerAuth: []
@@ -2083,6 +2111,7 @@ paths:
       - $ref: '#/components/parameters/RoleId'
     get:
       summary: Get a role (full object)
+      tags: [roles]
       operationId: getRole
       security:
         - bearerAuth: []
@@ -2121,6 +2150,7 @@ paths:
         role position.
         The @everyone role (role_id = guild_id) only accepts a "permissions"
         change and is subject to the same hierarchy (its position is 0).
+      tags: [roles]
       operationId: patchRole
       security:
         - bearerAuth: []
@@ -2173,6 +2203,7 @@ paths:
         hierarchy applies: the role's position must be strictly below the
         caller's highest role position. Assigned
         member roles are cascaded.
+      tags: [roles]
       operationId: deleteRole
       security:
         - bearerAuth: []
@@ -2206,6 +2237,7 @@ paths:
         above the target member's highest position (consequently a member cannot
         grant roles to themselves). The @everyone role cannot be granted.
         Deleted users are reported as 404.
+      tags: [roles]
       operationId: putRoleUser
       security:
         - bearerAuth: []
@@ -2224,6 +2256,7 @@ paths:
       description: |
         Idempotent: revoking a role the member does not have is a 204 no-op.
         Same role hierarchy and @everyone rules as PUT.
+      tags: [roles]
       operationId: deleteRoleUser
       security:
         - bearerAuth: []
@@ -2243,6 +2276,7 @@ paths:
       - $ref: '#/components/parameters/UserId'
     get:
       summary: List role IDs assigned to a member (projection)
+      tags: [roles]
       operationId: getMemberRoles
       security:
         - bearerAuth: []
@@ -2264,6 +2298,7 @@ paths:
       - $ref: '#/components/parameters/ChannelId'
     get:
       summary: Get a channel
+      tags: [channels]
       operationId: getChannel
       security:
         - bearerAuth: []
@@ -2297,6 +2332,7 @@ paths:
         moves the channel to the root; a category only accepts an absent or
         null parent_id. The new parent must exist, belong to the same guild
         and be a category.
+      tags: [channels]
       operationId: patchChannel
       security:
         - bearerAuth: []
@@ -2341,6 +2377,7 @@ paths:
     delete:
       summary: Delete a channel (delete_channels required)
       description: Child channels are not deleted; their parent_id becomes null.
+      tags: [channels]
       operationId: deleteChannel
       security:
         - bearerAuth: []
@@ -2359,6 +2396,7 @@ paths:
     get:
       summary: List messages (keyset pagination)
       description: before/after/around are mutually exclusive.
+      tags: [messages]
       operationId: getMessages
       security:
         - bearerAuth: []
@@ -2427,6 +2465,7 @@ paths:
         reference yields a file id, deduplicated in first-appearance order.
         At most `api.messages.max_attachments` unique
         ids are accepted and every id must reference an existing file.
+      tags: [messages]
       operationId: postMessage
       security:
         - bearerAuth: []
@@ -2442,7 +2481,8 @@ paths:
                   type: string
                   format: message-body
                 reply_to_id:
-                  $ref: '#/components/schemas/Id'
+                  allOf:
+                    - $ref: '#/components/schemas/Id'
                   nullable: true
                 embeds:
                   type: array
@@ -2497,6 +2537,7 @@ paths:
       - $ref: '#/components/parameters/ChannelId'
     get:
       summary: Changed channel messages since a cursor
+      tags: [sync]
       operationId: getChannelMessagesSync
       security:
         - bearerAuth: []
@@ -2535,6 +2576,7 @@ paths:
         Returns the channel's live (non-soft-deleted) webhooks in id order.
         Readable by any authenticated user (metadata is not permission-gated);
         the execute token is never included.
+      tags: [webhooks]
       operationId: getChannelWebhooks
       security:
         - bearerAuth: []
@@ -2570,6 +2612,7 @@ paths:
         `201 {"id","token"}`; the plaintext `token` is returned exactly once and
         only its sha256 is stored. Soft-deleted webhooks do not count against
         the cap. Dispatches a `webhook_created` gateway event.
+      tags: [webhooks]
       operationId: postChannelWebhook
       security:
         - bearerAuth: []
@@ -2618,6 +2661,7 @@ paths:
       description: >-
         Returns the ids (decimal strings, ascending) of the channel's pinned
         non-deleted messages. `before` and `after` are mutually exclusive.
+      tags: [messages]
       operationId: getChannelPins
       security:
         - bearerAuth: []
@@ -2675,6 +2719,7 @@ paths:
         Idempotent. The message must exist in the path channel and not be
         deleted. A real `false -> true` transition dispatches a
         `message_pinned` gateway event.
+      tags: [messages]
       operationId: pinMessage
       security:
         - bearerAuth: []
@@ -2707,6 +2752,7 @@ paths:
         Idempotent. The message must exist in the path channel and not be
         deleted. A real `true -> false` transition dispatches a
         `message_unpinned` gateway event.
+      tags: [messages]
       operationId: unpinMessage
       security:
         - bearerAuth: []
@@ -2738,6 +2784,7 @@ paths:
       - $ref: '#/components/parameters/MessageId'
     get:
       summary: Get a message (read_messages on the message's channel required)
+      tags: [messages]
       operationId: getMessage
       security:
         - bearerAuth: []
@@ -2786,6 +2833,7 @@ paths:
         recomputed from the new `content`; `allowed_mentions` is not accepted on
         edit because edits never notify.
         Returns the updated message object (the same shape as `GET`).
+      tags: [messages]
       operationId: editMessage
       security:
         - bearerAuth: []
@@ -2851,6 +2899,7 @@ paths:
         A non-author needs delete_messages on the message's channel and must
         be strictly higher in the role hierarchy than the author. Deletion is
         a soft delete: content is wiped and the message becomes anonymous.
+      tags: [messages]
       operationId: deleteMessage
       security:
         - bearerAuth: []
@@ -2891,6 +2940,7 @@ paths:
         fully-qualified form, so every form of one emoji is a single reaction.
         A new distinct emoji is rejected once the message already holds
         `api.messages.max_reactions` distinct emoji.
+      tags: [messages]
       operationId: putMessageReaction
       security:
         - bearerAuth: []
@@ -2941,6 +2991,7 @@ paths:
         With `user_id`, removes that user's reaction instead, which requires
         `delete_reactions` on the channel and being strictly higher in the role
         hierarchy than the target. Idempotent (a missing reaction is still 204).
+      tags: [messages]
       operationId: deleteMessageReaction
       security:
         - bearerAuth: []
@@ -3010,6 +3061,7 @@ paths:
         so the array length matches the corresponding `count` of
         `GET /messages/{message_id}/reactions`. Returns an empty array (not 404)
         when nobody reacted with that emoji.
+      tags: [messages]
       operationId: getMessageReactionUsers
       security:
         - bearerAuth: []
@@ -3087,6 +3139,7 @@ paths:
       - $ref: '#/components/parameters/ChannelId'
     put:
       summary: Create or update a channel permission overwrite (upsert)
+      tags: [channels]
       operationId: putOverwrite
       description: >-
         Upserts an overwrite for a role or member on the channel. Setting
@@ -3155,6 +3208,7 @@ paths:
         name/avatar; management endpoints instead treat a deleted webhook as
         404. Readable by any authenticated user (metadata is not
         permission-gated).
+      tags: [webhooks]
       operationId: getWebhook
       security:
         - bearerAuth: []
@@ -3186,6 +3240,7 @@ paths:
         soft-deleted webhook is 404. On success the endpoint returns
         `204 No Content` (there is no server-derived field to return) and
         dispatches a `webhook_updated` gateway event.
+      tags: [webhooks]
       operationId: patchWebhook
       security:
         - bearerAuth: []
@@ -3235,6 +3290,7 @@ paths:
         Soft-deletes the webhook (`deleted_at`). A soft-deleted webhook is 404,
         so deleting twice returns 404 the second time. The row survives for
         message attribution. Dispatches a `webhook_deleted` gateway event.
+      tags: [webhooks]
       operationId: deleteWebhook
       security:
         - bearerAuth: []
@@ -3273,6 +3329,7 @@ paths:
         the management endpoints, a soft-deleted webhook is still served (like
         `GET /api/webhooks/{webhook_id}`) so its messages keep rendering. The
         response is immutable for a given hash, so it is safe to cache.
+      tags: [webhooks]
       operationId: getWebhookAvatar
       security: []
       parameters:
@@ -3286,7 +3343,7 @@ paths:
         '200':
           description: OK
           content:
-            image/webp:
+            application/octet-stream:
               schema:
                 type: string
                 format: binary
@@ -3311,32 +3368,21 @@ paths:
         animation caps is 400 "Bad image". A still JPEG is rotated to honor its
         EXIF orientation. A soft-deleted webhook is 404.
         Dispatches a `webhook_updated` gateway event.
+      tags: [webhooks]
       operationId: putWebhookAvatar
       security:
         - bearerAuth: []
       requestBody:
         required: true
         content:
-          image/webp:
+          application/octet-stream:
             schema:
               type: string
               format: binary
-          image/gif:
-            schema:
-              type: string
-              format: binary
-          image/png:
-            schema:
-              type: string
-              format: binary
-          image/jpeg:
-            schema:
-              type: string
-              format: binary
-          image/jpg:
-            schema:
-              type: string
-              format: binary
+        description: >-
+          Raw image bytes. The request `Content-Type` must be `image/webp`,
+          `image/gif`, `image/png`, `image/jpeg` or `image/jpg`; any other
+          type is rejected with 415.
       responses:
         '200':
           description: OK
@@ -3344,6 +3390,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [avatar_hash]
                 properties:
                   avatar_hash:
                     type: string
@@ -3382,6 +3429,7 @@ paths:
         Clears the avatar; idempotent (a webhook without an avatar still returns
         204). A soft-deleted webhook is 404. Dispatches a `webhook_updated`
         gateway event.
+      tags: [webhooks]
       operationId: deleteWebhookAvatar
       security:
         - bearerAuth: []
@@ -3425,6 +3473,7 @@ paths:
         for a webhook), `author_name`, `author_avatar_hash` and `webhook_id` so
         the client can render the author without an extra lookup. Returns the
         created message object.
+      tags: [webhooks]
       operationId: executeWebhook
       security: []
       parameters:
@@ -3451,7 +3500,8 @@ paths:
                   type: string
                   format: message-body
                 reply_to_id:
-                  $ref: '#/components/schemas/Id'
+                  allOf:
+                    - $ref: '#/components/schemas/Id'
                   nullable: true
                 embeds:
                   type: array
@@ -3513,6 +3563,7 @@ paths:
         `ping` event is a setup verification delivery; it is acknowledged with
         `204 No Content` and does not create a chat message. Deliveries are not
         deduplicated, so a redelivery can create another message.
+      tags: [webhooks]
       operationId: executeGitHubWebhook
       security: []
       parameters:
@@ -3579,6 +3630,7 @@ paths:
   /system/users:
     post:
       summary: Create a user (passwordless when password omitted; bots must not have a password)
+      tags: [system]
       operationId: postSystemUser
       security:
         - systemToken: []
@@ -3619,6 +3671,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [id]
                 properties:
                   id:
                     $ref: '#/components/schemas/Id'
@@ -3645,6 +3698,7 @@ paths:
         refresh tokens of the user and removes all of the user's push
         subscriptions. Avatars are managed by
         `PUT /users/@me/avatar`.
+      tags: [system]
       operationId: patchSystemUser
       security:
         - systemToken: []
@@ -3707,6 +3761,7 @@ paths:
         token is returned once; the server stores only its SHA-256 hash. Bot
         tokens have no expiry and are accepted by `bearerAuth` and the gateway
         `identify`.
+      tags: [system]
       operationId: putSystemUserBotToken
       security:
         - systemToken: []
@@ -3743,6 +3798,7 @@ paths:
                 $ref: '#/components/schemas/Error'
     delete:
       summary: Soft-delete a user
+      tags: [system]
       operationId: deleteSystemUser
       security:
         - systemToken: []
@@ -3760,6 +3816,7 @@ paths:
   /system/guilds:
     post:
       summary: Create a guild
+      tags: [system]
       operationId: postSystemGuild
       security:
         - systemToken: []
@@ -3786,6 +3843,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [id]
                 properties:
                   id:
                     $ref: '#/components/schemas/Id'
@@ -3804,6 +3862,7 @@ paths:
       - $ref: '#/components/parameters/GuildId'
     delete:
       summary: Delete a guild
+      tags: [system]
       operationId: deleteSystemGuild
       security:
         - systemToken: []
@@ -3825,6 +3884,7 @@ paths:
     delete:
       summary: Delete a role
       description: The @everyone role (role_id = guild_id) cannot be deleted.
+      tags: [system]
       operationId: deleteSystemRole
       security:
         - systemToken: []
@@ -3848,6 +3908,7 @@ paths:
   /system/superuser:
     post:
       summary: Create a superuser role and assign it to a user
+      tags: [system]
       operationId: postSystemSuperuser
       security:
         - systemToken: []
@@ -3870,6 +3931,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [id]
                 properties:
                   id:
                     $ref: '#/components/schemas/Id'
@@ -4226,7 +4288,7 @@ components:
         (member), role grant/revoke carry `target_id` (role) and
         `target_user_id` (member), and guild actions and the reorder actions
         carry neither.
-      required: [id, action, created_at]
+      required: [id, actor_id, action, target_id, target_user_id, channel_id, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -4325,6 +4387,7 @@ components:
           description: Access token lifetime, seconds
     User:
       type: object
+      required: [username, display_name, avatar_hash, is_bot]
       properties:
         username:
           type: string
@@ -4348,11 +4411,13 @@ components:
       allOf:
         - $ref: '#/components/schemas/User'
         - type: object
+          required: [id]
           properties:
             id:
               $ref: '#/components/schemas/Id'
     Guild:
       type: object
+      required: [id, name, avatar_hash]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -4370,6 +4435,7 @@ components:
             `GET /guilds/{guild_id}/avatar?hash={avatar_hash}`.
     Emoji:
       type: object
+      required: [id, name, icon_hash]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -4401,7 +4467,7 @@ components:
             fully-qualified form.
     ReactionSummary:
       type: object
-      required: [count, me]
+      required: [emoji_id, unicode_emoji, count, me]
       description: >-
         Exactly one of `emoji_id` / `unicode_emoji` is set; `count` is the
         number of non-deleted users who reacted with that emoji (equal to the
@@ -4425,6 +4491,7 @@ components:
       enum: [channel, category]
     Channel:
       type: object
+      required: [id, parent_id, kind, name, topic, position, last_message_id, permissions, overwrites]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -4480,6 +4547,7 @@ components:
       allOf:
         - $ref: '#/components/schemas/Channel'
         - type: object
+          required: [guild_id]
           properties:
             guild_id:
               $ref: '#/components/schemas/Id'
@@ -4599,6 +4667,7 @@ components:
             $ref: '#/components/schemas/EmbedField'
     Message:
       type: object
+      required: [id, channel_id, author_id, webhook_id, content, created_at, reply_to_id, edited_at, embeds, attachments, mention_everyone, mentions, mention_roles, pinned, reactions]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -4609,14 +4678,16 @@ components:
             client can locate the message regardless of which endpoint returned
             it.
         author_id:
-          $ref: '#/components/schemas/Id'
+          allOf:
+            - $ref: '#/components/schemas/Id'
           nullable: true
           description: >-
             Author user id; null for a webhook message (which carries
             `webhook_id` instead). `author_id` and `webhook_id` are mutually
             exclusive.
         webhook_id:
-          $ref: '#/components/schemas/Id'
+          allOf:
+            - $ref: '#/components/schemas/Id'
           nullable: true
           description: >-
             Webhook id when the message was posted by a webhook; null for a user
@@ -4631,7 +4702,8 @@ components:
           format: int64
           description: Unix epoch, milliseconds
         reply_to_id:
-          $ref: '#/components/schemas/Id'
+          allOf:
+            - $ref: '#/components/schemas/Id'
           nullable: true
         edited_at:
           type: integer
@@ -4690,19 +4762,22 @@ components:
             longer exists.
     MessageWithoutId:
       type: object
+      required: [channel_id, author_id, webhook_id, content, created_at, reply_to_id, edited_at, embeds, attachments, mention_everyone, mentions, mention_roles, pinned, reactions]
       properties:
         channel_id:
           $ref: '#/components/schemas/Id'
           description: Id of the channel the message belongs to.
         author_id:
-          $ref: '#/components/schemas/Id'
+          allOf:
+            - $ref: '#/components/schemas/Id'
           nullable: true
           description: >-
             Author user id; null for a webhook message (which carries
             `webhook_id` instead). `author_id` and `webhook_id` are mutually
             exclusive.
         webhook_id:
-          $ref: '#/components/schemas/Id'
+          allOf:
+            - $ref: '#/components/schemas/Id'
           nullable: true
           description: >-
             Webhook id when the message was posted by a webhook; null for a user
@@ -4717,7 +4792,8 @@ components:
           format: int64
           description: Unix epoch, milliseconds
         reply_to_id:
-          $ref: '#/components/schemas/Id'
+          allOf:
+            - $ref: '#/components/schemas/Id'
           nullable: true
         edited_at:
           type: integer
@@ -4791,6 +4867,7 @@ components:
             `offset`/`limit`.
     Role:
       type: object
+      required: [id, name, position, permissions, color, mentionable]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -4825,11 +4902,13 @@ components:
       allOf:
         - $ref: '#/components/schemas/Role'
         - type: object
+          required: [guild_id]
           properties:
             guild_id:
               $ref: '#/components/schemas/Id'
     Overwrite:
       type: object
+      required: [target_id, type, allow, deny]
       properties:
         target_id:
           allOf:
@@ -4844,19 +4923,23 @@ components:
           $ref: '#/components/schemas/PermissionBits'
     Limits:
       type: object
+      required: [guilds, channels, messages, search, sync, audit_log, embeds, roles, emojis, users, auth, media, files, push, webhooks]
       properties:
         guilds:
           type: object
+          required: [max_name_codepoints, max_emojis]
           properties:
             max_name_codepoints: { type: integer }
             max_emojis: { type: integer }
         channels:
           type: object
+          required: [max_name_codepoints, max_topic_codepoints]
           properties:
             max_name_codepoints: { type: integer }
             max_topic_codepoints: { type: integer }
         messages:
           type: object
+          required: [max_messages_limit, max_codepoints_per_message, max_reactions, max_reactions_users_limit, max_embeds, max_attachments, max_mention_users, max_mention_roles, max_allowed_mention_users, max_allowed_mention_roles]
           properties:
             max_messages_limit: { type: integer }
             max_codepoints_per_message: { type: integer }
@@ -4870,20 +4953,24 @@ components:
             max_allowed_mention_roles: { type: integer }
         search:
           type: object
+          required: [min_content_codepoints, max_content_codepoints, max_filter_ids]
           properties:
             min_content_codepoints: { type: integer }
             max_content_codepoints: { type: integer }
             max_filter_ids: { type: integer }
         sync:
           type: object
+          required: [max_lookback_s]
           properties:
             max_lookback_s: { type: integer }
         audit_log:
           type: object
+          required: [max_entries_limit]
           properties:
             max_entries_limit: { type: integer }
         embeds:
           type: object
+          required: [max_title_codepoints, max_description_codepoints, max_fields, max_footer_codepoints, max_author_name_codepoints, max_field_name_codepoints, max_field_value_codepoints, max_url_codepoints, max_total_codepoints]
           properties:
             max_title_codepoints: { type: integer }
             max_description_codepoints: { type: integer }
@@ -4896,15 +4983,18 @@ components:
             max_total_codepoints: { type: integer }
         roles:
           type: object
+          required: [max_name_codepoints]
           properties:
             max_name_codepoints: { type: integer }
         emojis:
           type: object
+          required: [min_name_codepoints, max_name_codepoints]
           properties:
             min_name_codepoints: { type: integer }
             max_name_codepoints: { type: integer }
         users:
           type: object
+          required: [min_username_codepoints, max_username_codepoints, min_display_name_codepoints, max_display_name_codepoints, max_userdata_bytes]
           properties:
             min_username_codepoints: { type: integer }
             max_username_codepoints: { type: integer }
@@ -4913,18 +5003,22 @@ components:
             max_userdata_bytes: { type: integer }
         auth:
           type: object
+          required: [password]
           properties:
             password:
               type: object
+              required: [min_codepoints, max_codepoints, max_bytes]
               properties:
                 min_codepoints: { type: integer }
                 max_codepoints: { type: integer }
                 max_bytes: { type: integer }
         media:
           type: object
+          required: [avatar, emoji]
           properties:
             avatar:
               type: object
+              required: [max_dimensions, max_bytes, max_animation_frames, max_animation_duration_ms]
               properties:
                 max_dimensions: { type: integer }
                 max_bytes: { type: integer }
@@ -4932,6 +5026,7 @@ components:
                 max_animation_duration_ms: { type: integer }
             emoji:
               type: object
+              required: [max_dimensions, max_bytes, max_animation_frames, max_animation_duration_ms]
               properties:
                 max_dimensions: { type: integer }
                 max_bytes: { type: integer }
@@ -4939,6 +5034,7 @@ components:
                 max_animation_duration_ms: { type: integer }
         files:
           type: object
+          required: [max_name_codepoints, max_size, whitelist, public_base_urls]
           properties:
             max_name_codepoints: { type: integer }
             max_size: { type: integer }
@@ -4974,12 +5070,14 @@ components:
             subscription endpoints still store rows but no notification is
             delivered. `vapid_public_key` is the base64url `applicationServerKey`
             the client passes to `PushManager.subscribe`.
+          required: [enabled, vapid_public_key, max_subscriptions_per_user]
           properties:
             enabled: { type: boolean }
             vapid_public_key: { type: string }
             max_subscriptions_per_user: { type: integer }
         webhooks:
           type: object
+          required: [max_webhooks_per_channel, max_name_codepoints]
           properties:
             max_webhooks_per_channel: { type: integer }
             max_name_codepoints: { type: integer }
