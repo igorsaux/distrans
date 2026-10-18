@@ -134,3 +134,28 @@ def test_mismatched_existing_id_hash_is_not_reused_or_uploaded():
         cur, S3(), 902, b"new bytes", {"filename": "x"}, counters
     ) is None
     assert "different bytes" in counters["warnings"][0]
+
+
+def test_reaction_emoji_canonicalized_to_fully_qualified():
+    canonical = importguild.load_emoji_canonical()
+
+    # Discord returns the emoji as the client sent it; the API stores and looks
+    # up the canonical form, so the importer must write the same one.
+    assert canonical["\u2764"] == "\u2764\ufe0f"
+    assert canonical["\u00a9"] == "\u00a9\ufe0f"
+    assert canonical["1\u20e3"] == "1\ufe0f\u20e3"
+
+    # A fully-qualified sequence is already canonical, and a lone regional
+    # indicator has no RGI form at all: neither is rewritten.
+    assert "\U0001f44d" not in canonical
+    assert "\U0001f1f5" not in canonical
+
+    rows = importguild.stage_message_reactions(
+        {"reactions": [{"emoji": "\u2764", "users": [1]}, {"emoji": "\U0001f1f5", "users": [2]}]},
+        5,
+        frozenset(),
+        {"reactions_skipped_empty": 0, "reactions_skipped_foreign": 0},
+        canonical,
+    )
+
+    assert rows == [(5, 1, 0, None, "\u2764\ufe0f"), (5, 2, 0, None, "\U0001f1f5")]

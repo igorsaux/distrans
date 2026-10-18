@@ -10,7 +10,8 @@
 # PUT       - R1 JSON content type + non-empty body; R2 logged in; R3 message
 #             exists; R4 add_reactions; R5 body object; R6 exactly one of
 #             emoji_id/unicode_emoji; R7 custom emoji exists in the message's
-#             guild; R8 unicode is one fully-qualified RGI sequence; R9 distinct
+#             guild; R8 unicode is one emoji sequence in any qualification form
+#             (stored canonicalized) or a regional indicator symbol; R9 distinct
 #             cap (api.messages.max_reactions); R10 idempotent add
 # DELETE    - R1 logged in; R2 message exists; R3 emoji params
 #             (emoji_id XOR unicode_emoji, none = remove all own); R4 optional
@@ -48,6 +49,10 @@ with CONFIG_PATH.open() as f:
 THUMBS_UP = "\U0001F44D"
 # Red heart, a different one.
 HEART = "\u2764\uFE0F"
+# The same heart without the emoji variation selector.
+HEART_UNQUALIFIED = "\u2764"
+# A lone regional indicator ("P").
+REGIONAL_INDICATOR_P = "\U0001F1F5"
 
 MAX_REACTIONS = CONFIG["api"]["messages"]["max_reactions"]
 MAX_REACTIONS_USERS_LIMIT = CONFIG["api"]["messages"]["max_reactions_users_limit"]
@@ -437,6 +442,43 @@ def test_get_reaction_users_returns_ids_ascending(
     assert all(isinstance(item, str) for item in body)
 
 
+# R5 - a unicode target is canonicalized, so any qualification form addresses
+# the identical stored reaction
+def test_get_reaction_users_canonicalizes_unicode(
+    db_conn, http_client, test_message, test_session, test_user
+):
+    _insert_reaction(db_conn, test_message.id, test_user.id, unicode_emoji=HEART)
+
+    response = _get_users(
+        http_client,
+        test_session.access_token,
+        test_message.id,
+        unicode_emoji=HEART_UNQUALIFIED,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == [str(test_user.id)]
+
+
+# R5 - a lone regional indicator is a valid unicode target
+def test_get_reaction_users_single_regional_indicator(
+    db_conn, http_client, test_message, test_session, test_user
+):
+    _insert_reaction(
+        db_conn, test_message.id, test_user.id, unicode_emoji=REGIONAL_INDICATOR_P
+    )
+
+    response = _get_users(
+        http_client,
+        test_session.access_token,
+        test_message.id,
+        unicode_emoji=REGIONAL_INDICATOR_P,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == [str(test_user.id)]
+
+
 def test_get_reaction_users_custom_emoji(
     db_conn, http_client, test_guild, test_message, test_user, test_session
 ):
@@ -654,7 +696,7 @@ def test_put_reaction_foreign_guild_emoji(
 
 # R8
 def test_put_reaction_rejects_invalid_unicode(http_client, test_message, test_session):
-    for value in ["", "a", "\u263A", THUMBS_UP + THUMBS_UP]:
+    for value in ["", "a", "\U0001F3FB", THUMBS_UP + THUMBS_UP]:
         response = _put(http_client, test_session.access_token, test_message.id, {"unicode_emoji": value})
 
         assert response.status_code == 400, value
@@ -683,6 +725,76 @@ def test_put_reaction_unicode_success_and_idempotent(
             "me": True,
         }
     ]
+
+
+# R8 + R10
+def test_put_reaction_canonicalizes_unicode(
+    http_client, test_message, test_session
+):
+    response = _put(
+        http_client,
+        test_session.access_token,
+        test_message.id,
+        {"unicode_emoji": HEART_UNQUALIFIED},
+    )
+
+    assert response.status_code == 204
+
+    # The stored target is the fully-qualified sequence, not the bare heart.
+    body = _message_reactions(http_client, test_session.access_token, test_message.id)
+    assert body == [
+        {
+            "emoji_id": None,
+            "unicode_emoji": HEART,
+            "count": 1,
+            "me": True,
+        }
+    ]
+
+    # Removing through either form addresses the same reaction.
+    response = _delete(
+        http_client,
+        test_session.access_token,
+        test_message.id,
+        unicode_emoji=HEART_UNQUALIFIED,
+    )
+
+    assert response.status_code == 204
+    assert _message_reactions(http_client, test_session.access_token, test_message.id) == []
+
+
+# R8 + R10
+def test_put_reaction_single_regional_indicator(
+    http_client, test_message, test_session
+):
+    response = _put(
+        http_client,
+        test_session.access_token,
+        test_message.id,
+        {"unicode_emoji": REGIONAL_INDICATOR_P},
+    )
+
+    assert response.status_code == 204
+
+    body = _message_reactions(http_client, test_session.access_token, test_message.id)
+    assert body == [
+        {
+            "emoji_id": None,
+            "unicode_emoji": REGIONAL_INDICATOR_P,
+            "count": 1,
+            "me": True,
+        }
+    ]
+
+    response = _delete(
+        http_client,
+        test_session.access_token,
+        test_message.id,
+        unicode_emoji=REGIONAL_INDICATOR_P,
+    )
+
+    assert response.status_code == 204
+    assert _message_reactions(http_client, test_session.access_token, test_message.id) == []
 
 
 # R7 + R10

@@ -221,38 +221,86 @@ fn codepointsToUtf8(buffer: []u8, spec: []const u8) ![]const u8 {
     return buffer[0..o];
 }
 
+/// Iterates the `emoji-test.txt` rows, yielding the raw sequence and status.
+const EmojiRowIterator = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    const Row = struct {
+        sequence: []const u8,
+        status: []const u8,
+    };
+
+    fn next(this: *EmojiRowIterator) ?Row {
+        while (this.pos < this.data.len) {
+            const start = this.pos;
+            const end = std.mem.findScalarPos(u8, this.data, start, '\n') orelse this.data.len;
+
+            this.pos = end + 1;
+
+            var line = this.data[start..end];
+
+            if (std.mem.findScalar(u8, line, '#')) |hash| {
+                line = line[0..hash];
+            }
+
+            line = std.mem.trim(u8, line, " \t\r");
+
+            if (line.len == 0) {
+                continue;
+            }
+
+            var fields = std.mem.splitScalar(u8, line, ';');
+
+            return .{
+                .sequence = std.mem.trim(u8, fields.next() orelse continue, " \t"),
+                .status = std.mem.trim(u8, fields.next() orelse continue, " \t"),
+            };
+        }
+
+        return null;
+    }
+};
+
+/// Returns `s` without U+FE0F VARIATION SELECTOR-16 (`EF B8 8F`), which is the
+/// only thing distinguishing the qualification forms of one emoji from each
+/// other. The result is arena-owned.
+fn stripVariationSelectors(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(arena);
+
+    var i: usize = 0;
+
+    while (i < s.len) {
+        if (i + 2 < s.len and s[i] == 0xEF and s[i + 1] == 0xB8 and s[i + 2] == 0x8F) {
+            i += 3;
+
+            continue;
+        }
+
+        try out.append(arena, s[i]);
+
+        i += 1;
+    }
+
+    return out.toOwnedSlice(arena);
+}
+
 /// Collects unique, sorted UTF-8 encodings of the `fully-qualified` emoji
 /// sequences in `emoji-test.txt`.
 fn collectEmoji(arena: std.mem.Allocator, data: []const u8) ![][]const u8 {
     var items: std.ArrayList([]const u8) = .empty;
     defer items.deinit(arena);
 
-    var lines = std.mem.splitScalar(u8, data, '\n');
+    var rows: EmojiRowIterator = .{ .data = data };
 
-    while (lines.next()) |raw_line| {
-        var line = raw_line;
-
-        if (std.mem.findScalar(u8, line, '#')) |hash| {
-            line = line[0..hash];
-        }
-
-        line = std.mem.trim(u8, line, " \t\r");
-
-        if (line.len == 0) {
-            continue;
-        }
-
-        var fields = std.mem.splitScalar(u8, line, ';');
-
-        const sequence = std.mem.trim(u8, fields.next() orelse continue, " \t");
-        const status = std.mem.trim(u8, fields.next() orelse continue, " \t");
-
-        if (!std.mem.eql(u8, status, "fully-qualified")) {
+    while (rows.next()) |row| {
+        if (!std.mem.eql(u8, row.status, "fully-qualified")) {
             continue;
         }
 
         var buffer: [128]u8 = undefined;
-        const utf8 = try codepointsToUtf8(&buffer, sequence);
+        const utf8 = try codepointsToUtf8(&buffer, row.sequence);
 
         try items.append(arena, try arena.dupe(u8, utf8));
     }
@@ -269,6 +317,89 @@ fn collectEmoji(arena: std.mem.Allocator, data: []const u8) ![][]const u8 {
 
             n += 1;
         }
+    }
+
+    return slice[0..n];
+}
+
+const EmojiCanonicalPair = struct {
+    variant: []const u8,
+    canonical: []const u8,
+};
+
+/// Builds the variant -> fully-qualified map for every non-fully-qualified
+/// qualification form (`minimally-qualified` and `unqualified`). Component
+/// sequences have no fully-qualified counterpart and are skipped. The result is
+/// sorted by variant and free of duplicates.
+fn collectEmojiCanonical(arena: std.mem.Allocator, data: []const u8) ![]EmojiCanonicalPair {
+    var canonical_by_key: std.StringHashMap([]const u8) = .init(arena);
+    defer canonical_by_key.deinit();
+
+    {
+        var rows: EmojiRowIterator = .{ .data = data };
+
+        while (rows.next()) |row| {
+            if (!std.mem.eql(u8, row.status, "fully-qualified")) {
+                continue;
+            }
+
+            var buffer: [128]u8 = undefined;
+            const utf8 = try codepointsToUtf8(&buffer, row.sequence);
+
+            try canonical_by_key.put(
+                try stripVariationSelectors(arena, utf8),
+                try arena.dupe(u8, utf8),
+            );
+        }
+    }
+
+    var pairs: std.ArrayList(EmojiCanonicalPair) = .empty;
+    defer pairs.deinit(arena);
+
+    {
+        var rows: EmojiRowIterator = .{ .data = data };
+
+        while (rows.next()) |row| {
+            if (std.mem.eql(u8, row.status, "fully-qualified")) {
+                continue;
+            }
+
+            var buffer: [128]u8 = undefined;
+            const utf8 = try codepointsToUtf8(&buffer, row.sequence);
+
+            const canonical = canonical_by_key.get(try stripVariationSelectors(arena, utf8)) orelse continue;
+
+            if (std.mem.eql(u8, utf8, canonical)) {
+                continue;
+            }
+
+            try pairs.append(arena, .{
+                .variant = try arena.dupe(u8, utf8),
+                .canonical = canonical,
+            });
+        }
+    }
+
+    const slice = try arena.dupe(EmojiCanonicalPair, pairs.items);
+
+    std.mem.sort(EmojiCanonicalPair, slice, {}, struct {
+        fn lessThan(_: void, a: EmojiCanonicalPair, b: EmojiCanonicalPair) bool {
+            return lessThanString({}, a.variant, b.variant);
+        }
+    }.lessThan);
+
+    var n: usize = 0;
+
+    for (slice) |pair| {
+        if (n != 0 and std.mem.eql(u8, slice[n - 1].variant, pair.variant)) {
+            std.debug.assert(std.mem.eql(u8, slice[n - 1].canonical, pair.canonical));
+
+            continue;
+        }
+
+        slice[n] = pair;
+
+        n += 1;
     }
 
     return slice[0..n];
@@ -738,6 +869,36 @@ pub fn main(init: std.process.Init) !void {
             }
 
             try data_writer.interface.writeAll("\", {} },\n");
+        }
+    }
+
+    try data_writer.interface.writeAll("});\n\n");
+
+    try data_writer.interface.writeAll(
+        \\/// Maps every non-fully-qualified qualification form (minimally-qualified
+        \\/// or unqualified) of an emoji to the fully-qualified RGI sequence it
+        \\/// denotes. Reaction targets are canonicalized through this before being
+        \\/// stored or looked up, so a bare heart and a heart with U+FE0F are the
+        \\/// same reaction.
+        \\pub const EMOJI_CANONICAL: std.StaticStringMap([]const u8) = .initComptime(.{
+        \\
+    );
+
+    if (emoji_test_data) |data| {
+        for (try collectEmojiCanonical(arena, data)) |pair| {
+            try data_writer.interface.writeAll("    .{ \"");
+
+            for (pair.variant) |byte| {
+                try data_writer.interface.print("\\x{X:0>2}", .{byte});
+            }
+
+            try data_writer.interface.writeAll("\", \"");
+
+            for (pair.canonical) |byte| {
+                try data_writer.interface.print("\\x{X:0>2}", .{byte});
+            }
+
+            try data_writer.interface.writeAll("\" },\n");
         }
     }
 

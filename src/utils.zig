@@ -1033,7 +1033,7 @@ pub inline fn parseMentionIds(
         return &.{};
     }
 
-    return std.json.parseFromSliceLeaky([]const []const u8, allocator, text, .{}) catch |err| {
+    return std.json.parseFromSliceLeaky([]const []const u8, allocator, text, .{ .allocate = .alloc_always }) catch |err| {
         std.log.scoped(.utils).err("failed to parse mention ids from DB: {t}", .{err});
 
         return err;

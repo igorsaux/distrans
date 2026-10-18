@@ -201,6 +201,43 @@ def test_get_messages_around(
     assert [m["id"] for m in body] == ["1", "2", "3", "4", "5"]
 
 
+# The message rows carry inline reactions aggregated by SQL. Their JSON used to
+# be parsed without copying, so the ids aliased the libpq result buffer that
+# `GetMessages` frees after the last row; the channel page then served a
+# corrupted id (e.g. 819437962323296256 -> 319437962323296256) and every
+# reaction request for it was a 400. The deterministic coverage for that
+# aliasing is `Message.fromRepo copies JSON strings out of the query buffer`
+# (src/route/types.zig); this test pins the end-to-end shape of the page.
+def test_get_messages_around_keeps_inline_reaction_targets(
+    http_client, db_conn, test_channel, test_user, test_session
+):
+    insert_messages(db_conn, test_channel.id, test_user.id, [1, 2, 3])
+
+    emoji_id = 819437962323296256
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO app.emojis (id, guild_id, name, icon_data, icon_hash)"
+            " SELECT %s, c.guild_id, %s, %s, %s FROM app.channels c WHERE c.id = %s",
+            (emoji_id, "kept", b"\x00", "0" * 16, test_channel.id),
+        )
+        cur.execute(
+            "INSERT INTO app.message_reactions"
+            " (message_id, user_id, emoji_kind, emoji_id, unicode_emoji)"
+            " VALUES (%s, %s, 1, %s, NULL), (%s, %s, 0, NULL, %s)",
+            (2, test_user.id, emoji_id, 2, test_user.id, "\U0001F1F5"),
+        )
+
+    body = _get_messages(http_client, test_channel, test_session, around=2, limit=5)
+
+    target = next(message for message in body if message["id"] == "2")
+
+    assert target["reactions"] == [
+        {"emoji_id": str(emoji_id), "unicode_emoji": None, "count": 1, "me": True},
+        {"emoji_id": None, "unicode_emoji": "\U0001F1F5", "count": 1, "me": True},
+    ]
+
+
 def test_get_messages_around_partial(
     http_client, db_conn, test_channel, test_user, test_session
 ):

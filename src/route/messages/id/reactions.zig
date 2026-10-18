@@ -18,26 +18,25 @@ inline fn fillUnicode(buf: *[MAX_UNICODE_EMOJI_BYTES]u8, text: ?[]const u8) u8 {
     return @intCast(n);
 }
 
-/// Returns `true` when a unicode target is exactly one fully-qualified RGI
-/// sequence (byte-exact membership in the generated set already guarantees a
-/// single sequence: concatenations, minimally-qualified, unqualified and
-/// component sequences are all absent from the set). A custom target is
-/// checked against the message's guild by the caller instead.
-inline fn validateEmoji(
+/// Returns the canonical form of a reaction target, or `null` when it is not
+/// exactly one emoji sequence. A unicode target is normalized to its
+/// fully-qualified RGI sequence (`root.unicode.canonicalReactionEmoji`), so a
+/// bare heart, a heart with U+FE0F and any other qualification form are stored
+/// and looked up as one reaction; a lone regional indicator is kept as-is. A
+/// custom target is canonical by definition (the caller checks guild
+/// membership).
+inline fn canonicalizeEmoji(
     emoji: root.repo.reactions.Emoji,
-) bool {
+) ?root.repo.reactions.Emoji {
     switch (emoji) {
         .unicode => |text| {
-            // Byte-exact membership in the fully-qualified RGI set already
-            // guarantees a single sequence: concatenations, minimally-qualified,
-            // unqualified and component sequences are all absent from the set.
             if (text.len > MAX_UNICODE_EMOJI_BYTES) {
-                return false;
+                return null;
             }
 
-            return root.unicode.isFullyQualifiedEmoji(text);
+            return .{ .unicode = root.unicode.canonicalReactionEmoji(text) orelse return null };
         },
-        .custom => return true,
+        .custom => return emoji,
     }
 }
 
@@ -282,7 +281,9 @@ const GetUsersTask = struct {
 ///      (400 "Unknown parameter" / "Bad 'limit' parameter" /
 ///      "Bad 'after' parameter" /
 ///      "Specify exactly one of 'emoji_id' or 'unicode_emoji'" /
-///      "'emoji_id' is invalid" / "'unicode_emoji' is invalid")
+///      "'emoji_id' is invalid" / "'unicode_emoji' is invalid"). A unicode
+///      target is canonicalized to its fully-qualified RGI sequence before
+///      matching, so every qualification form addresses the same reaction.
 pub inline fn usersGetHandle(
     allocator: std.mem.Allocator,
     request: *const root.http.Request,
@@ -327,15 +328,9 @@ pub inline fn usersGetHandle(
 
     const emoji: root.repo.reactions.Emoji = if (emoji_id) |id|
         .{ .custom = id }
-    else blk: {
-        const target: root.repo.reactions.Emoji = .{ .unicode = unicode.? };
-
-        if (!validateEmoji(target)) {
+    else
+        canonicalizeEmoji(.{ .unicode = unicode.? }) orelse
             return try root.route.generic.badRequestReasonTask(response, "'unicode_emoji' is invalid");
-        }
-
-        break :blk target;
-    };
 
     return try GetUsersTask.task(request, response, .{
         .message_id = message_id,
@@ -356,8 +351,11 @@ pub inline fn usersGetHandle(
 ///      "'emoji_id' is not a string" / "'unicode_emoji' is not a string")
 /// R7 - a custom "emoji_id" must parse as a snowflake and name an existing
 ///      emoji of the message's guild (400 "'emoji_id' is invalid")
-/// R8 - a "unicode_emoji" must be exactly one fully-qualified RGI sequence,
-///      encoded in at most root.types.MAX_UNICODE_EMOJI_BYTES bytes
+/// R8 - a "unicode_emoji" must be exactly one emoji sequence in any
+///      qualification form (fully-qualified, minimally-qualified, unqualified)
+///      or one regional indicator symbol, encoded in at most
+///      root.types.MAX_UNICODE_EMOJI_BYTES bytes; it is stored in its
+///      canonical fully-qualified form
 ///      (400 "'unicode_emoji' is invalid")
 /// R9 - adding a new distinct emoji is rejected once the message already holds
 ///      api.messages.max_reactions distinct emoji (400 "Too many reactions")
@@ -505,15 +503,11 @@ const PutTask = struct {
                 }
 
                 // R8
-                const emoji: root.repo.reactions.Emoji = .{ .unicode = value.string };
-
-                if (!validateEmoji(emoji)) {
+                this.emoji = canonicalizeEmoji(.{ .unicode = value.string }) orelse {
                     _ = root.route.generic.responseErrorMessage(this.response, .bad_request, "'unicode_emoji' is invalid");
 
                     return .ready;
-                }
-
-                this.emoji = emoji;
+                };
             }
         }
 
@@ -702,8 +696,10 @@ pub inline fn putHandle(
 ///      "unicode_emoji"; neither means removing all of the caller's reactions.
 ///      `emoji_id` must parse as a snowflake and name an existing emoji of the
 ///      message's guild (400 "'emoji_id' is invalid"); a `unicode_emoji` must
-///      be exactly one fully-qualified RGI sequence
-///      (400 "'unicode_emoji' is invalid"). Unknown parameters are rejected
+///      be exactly one emoji sequence in any qualification form or one regional
+///      indicator symbol, canonicalized to its fully-qualified form before
+///      matching (400 "'unicode_emoji' is invalid"). Unknown parameters are
+///      rejected
 ///      (400 "Unknown parameter") and both emoji params together are rejected
 ///      (400 "Specify exactly one of 'emoji_id' or 'unicode_emoji'").
 /// R4 - an optional "user_id" target must parse (400 "Bad 'user_id'
@@ -996,16 +992,12 @@ pub inline fn deleteHandle(
 
     const emoji: ?root.repo.reactions.Emoji = if (emoji_id) |id|
         .{ .custom = id }
-    else if (unicode) |text| blk: {
-        const target: root.repo.reactions.Emoji = .{ .unicode = text };
-
+    else if (unicode) |text|
         // R3
-        if (!validateEmoji(target)) {
-            return try root.route.generic.badRequestReasonTask(response, "'unicode_emoji' is invalid");
-        }
-
-        break :blk target;
-    } else null;
+        canonicalizeEmoji(.{ .unicode = text }) orelse
+            return try root.route.generic.badRequestReasonTask(response, "'unicode_emoji' is invalid")
+    else
+        null;
 
     return try DeleteTask.task(request, response, .{
         .message_id = message_id,

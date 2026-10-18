@@ -9,8 +9,11 @@ const root = @import("../root.zig");
 
 const SCOPE = std.log.scoped(.repo_reactions);
 
-/// A reaction target: a custom emoji (`app.emojis.id`) or exactly one
-/// fully-qualified unicode sequence (see `root.unicode.isFullyQualifiedEmoji`).
+/// A reaction target: a custom emoji (`app.emojis.id`) or exactly one unicode
+/// sequence in canonical form, i.e. a fully-qualified RGI sequence, or a lone
+/// regional indicator symbol (see `root.unicode.canonicalReactionEmoji`). Rows
+/// and lookups both use the canonical form, so every qualification form of one
+/// emoji is a single reaction.
 pub const Emoji = union(enum) {
     custom: root.types.EmojiId,
     unicode: []const u8,

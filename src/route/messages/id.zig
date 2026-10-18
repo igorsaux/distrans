@@ -158,7 +158,7 @@ const GetTask = struct {
                 .edited_at = this.get_message_task.?.result.?.edited_at,
                 .embeds = blk: {
                     if (this.get_message_task.?.result.?.embeds) |embeds| {
-                        const embeds_parsed = std.json.parseFromSliceLeaky([]const root.types.Embed, this.response.allocator, embeds, .{}) catch |err| {
+                        const embeds_parsed = std.json.parseFromSliceLeaky([]const root.types.Embed, this.response.allocator, embeds, .{ .allocate = .alloc_always }) catch |err| {
                             SCOPE.err("GET bad embeds in DB: {t}", .{err});
 
                             return .{ .err = err };
@@ -188,7 +188,7 @@ const GetTask = struct {
                 .pinned = this.get_message_task.?.result.?.pinned,
                 .reactions = blk: {
                     if (this.get_message_task.?.result.?.reactions) |reactions_json| {
-                        const parsed = std.json.parseFromSliceLeaky([]const root.route.types.Reaction, this.response.allocator, reactions_json, .{}) catch |err| {
+                        const parsed = std.json.parseFromSliceLeaky([]const root.route.types.Reaction, this.response.allocator, reactions_json, .{ .allocate = .alloc_always }) catch |err| {
                             SCOPE.err("GET bad reactions in DB: {t}", .{err});
 
                             return .{ .err = err };

@@ -65,7 +65,10 @@ WHAT IS TRANSFERRED
       backfilled fill-only: a pin the dump has but the DB lacks is added, while
       unpins done in-app afterwards are never cleared
     * reactions: every captured reaction user (unicode or custom emoji) as an
-      `app.message_reactions` row; no timestamp (the dump has none)
+      `app.message_reactions` row; no timestamp (the dump has none). A unicode
+      emoji is stored in its canonical fully-qualified form (the variant rows
+      of the pinned `emoji-test.txt` map onto it), matching what the API
+      stores and looks up
     * attachments: `app.files` + `app.message_attachments` rows and `files/<sha256>`
       S3 objects, for Discord-CDN URLs only and only for selected channels
       (see ATTACHMENTS)
@@ -1308,6 +1311,72 @@ def load_emoji_dump(guild_dir, report):
     return emojis
 
 
+def load_emoji_canonical():
+    """Map unqualified/minimally-qualified unicode emoji to the canonical form.
+
+    Discord returns reaction emoji exactly as the client sent them, so the dump
+    can carry e.g. a bare heart without U+FE0F. The API stores and looks up the
+    fully-qualified RGI sequence, so the importer must write the same form or
+    the pill and its reactor list would address different strings. The mapping
+    comes from the pinned ``emoji-test.txt`` in this repository: a
+    non-fully-qualified row shares its U+FE0F-stripped sequence with exactly
+    one fully-qualified row.
+    """
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    paths = glob.glob(
+        os.path.join(base, "tools", "data", "unicode", "*", "emoji", "emoji-test.txt")
+    )
+
+    if not paths:
+        fail(
+            "emoji-test.txt not found under tools/data/unicode; reactions cannot be "
+            "canonicalized"
+        )
+
+    def version_key(path):
+        version = os.path.basename(os.path.dirname(os.path.dirname(path)))
+
+        return tuple(int(part) if part.isdigit() else 0 for part in version.split("."))
+
+    path = max(paths, key=version_key)
+
+    rows = []
+    fully_qualified = {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+
+            if not line:
+                continue
+
+            sequence, _, status = line.partition(";")
+            status = status.strip()
+
+            if not status:
+                continue
+
+            text = "".join(chr(int(cp, 16)) for cp in sequence.split())
+
+            rows.append((text, status))
+
+            if status == "fully-qualified":
+                fully_qualified[text.replace("\ufe0f", "")] = text
+
+    canonical = {}
+
+    for text, status in rows:
+        if status == "fully-qualified":
+            continue
+
+        target = fully_qualified.get(text.replace("\ufe0f", ""))
+
+        if target is not None and target != text:
+            canonical[text] = target
+
+    return canonical
+
+
 def load_webhook_dump(guild_dir, report):
     """Load the guild's webhooks from ``webhooks.jsonl``.
 
@@ -1890,7 +1959,7 @@ def sync_avatars(conn, cur, guild_id, guild, cache, limits, refresh, report):
 def import_message_file(
     cur, guild_id, channel_id, path, cache, member_ids, known_user_ids, inserted_user_ids,
     known_webhook_ids, pending_webhooks, usernames, deleted_ids, max_embeds, report,
-    want_attachments=False, guild_emoji_ids=frozenset()
+    want_attachments=False, guild_emoji_ids=frozenset(), emoji_canonical=None
 ):
     pending_users = set()
     staged_attachments = []
@@ -1965,7 +2034,7 @@ def import_message_file(
                 written += 1
 
                 for row in stage_message_reactions(
-                    message, message_id, guild_emoji_ids, report
+                    message, message_id, guild_emoji_ids, report, emoji_canonical
                 ):
                     staged_reactions.append(row)
                     pending_users.add(row[1])
@@ -2078,7 +2147,9 @@ def message_has_payload(message):
     return bool(message.get("attachments"))
 
 
-def stage_message_reactions(message, message_id, guild_emoji_ids, report):
+def stage_message_reactions(
+    message, message_id, guild_emoji_ids, report, emoji_canonical=None
+):
     """Stage one row per captured reacting user for every reaction.
 
     A custom emoji must be part of this guild (``guild_emoji_ids``, from
@@ -2112,7 +2183,8 @@ def stage_message_reactions(message, message_id, guild_emoji_ids, report):
                 continue
 
             emoji_id = None
-            kind, unicode_emoji = 0, emoji
+            kind = 0
+            unicode_emoji = (emoji_canonical or {}).get(emoji, emoji)
 
         for user_id in users:
             rows.append((message_id, int(user_id), kind, emoji_id, unicode_emoji))
@@ -2939,6 +3011,7 @@ def run_import(guild_dir, report_path, args):
     placeholder_ids = override_member_ids - member_ids
 
     emoji_dump = load_emoji_dump(guild_dir, report)
+    emoji_canonical = load_emoji_canonical()
     emoji_state = {}
     known_webhook_ids = set()
 
@@ -3063,6 +3136,7 @@ def run_import(guild_dir, report_path, args):
                             args.attachments_blacklist,
                         ),
                         guild_emoji_ids=guild_emoji_ids,
+                        emoji_canonical=emoji_canonical,
                     )
                     inserted_ids = flush_messages(cur, report)
 

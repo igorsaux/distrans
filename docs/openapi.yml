@@ -2885,7 +2885,10 @@ paths:
       description: >-
         Adds the caller's reaction. Re-adding the same emoji is idempotent
         (still 204). A custom `emoji_id` must belong to the message's guild.
-        A `unicode_emoji` must be exactly one fully-qualified RGI sequence.
+        `unicode_emoji` must be exactly one emoji sequence in any qualification
+        form (fully-qualified, minimally-qualified or unqualified) or one
+        regional indicator symbol; it is stored in its canonical
+        fully-qualified form, so every form of one emoji is a single reaction.
         A new distinct emoji is rejected once the message already holds
         `api.messages.max_reactions` distinct emoji.
       operationId: putMessageReaction
@@ -2956,7 +2959,10 @@ paths:
           schema:
             type: string
           description: >-
-            A single fully-qualified RGI emoji sequence, percent-encoded.
+            One emoji sequence in any qualification form (fully-qualified,
+            minimally-qualified or unqualified) or a regional indicator symbol,
+            percent-encoded. Canonicalized to the fully-qualified form before
+            matching.
             Mutually exclusive with `emoji_id`.
         - name: user_id
           in: query
@@ -3022,7 +3028,10 @@ paths:
           schema:
             type: string
           description: >-
-            A single fully-qualified RGI emoji sequence, percent-encoded.
+            One emoji sequence in any qualification form (fully-qualified,
+            minimally-qualified or unqualified) or a regional indicator symbol,
+            percent-encoded. Canonicalized to the fully-qualified form before
+            matching.
             Mutually exclusive with `emoji_id`; exactly one is required.
         - name: limit
           in: query
@@ -4386,8 +4395,10 @@ components:
         unicode_emoji:
           type: string
           description: >-
-            Exactly one fully-qualified RGI emoji sequence (raw UTF-8, not
-            percent-encoded).
+            Exactly one emoji sequence in any qualification form (fully-qualified,
+            minimally-qualified or unqualified) or a regional indicator symbol
+            (raw UTF-8, not percent-encoded). Stored in its canonical
+            fully-qualified form.
     ReactionSummary:
       type: object
       required: [count, me]

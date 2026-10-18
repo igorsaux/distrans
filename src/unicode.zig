@@ -363,6 +363,38 @@ pub inline fn isFullyQualifiedEmoji(s: []const u8) bool {
     return unicode.EMOJI_FULLY_QUALIFIED.get(s) != null;
 }
 
+/// Canonicalizes a unicode reaction target: returns the fully-qualified RGI
+/// sequence for an emoji in any qualification form (`unqualified` and
+/// `minimally-qualified` forms are generated from `emoji-test.txt`), or the
+/// regional indicator itself, which has no RGI form. Returns `null` for
+/// anything that is not exactly one emoji sequence (components, concatenations,
+/// arbitrary text).
+///
+/// Callers store and look up the canonical form so two renderings of one emoji
+/// cannot become two different reactions.
+pub inline fn canonicalReactionEmoji(s: []const u8) ?[]const u8 {
+    if (unicode.EMOJI_CANONICAL.get(s)) |canonical| {
+        return canonical;
+    }
+
+    if (isFullyQualifiedEmoji(s) or isRegionalIndicator(s)) {
+        return s;
+    }
+
+    return null;
+}
+
+/// Returns `true` if `s` is exactly one regional indicator symbol
+/// (U+1F1E6 .. U+1F1FF), the letter emoji flags are built from.
+///
+/// `emoji-test.txt` only lists regional indicator *pairs* (and longer flag
+/// sequences) as fully-qualified.
+pub inline fn isRegionalIndicator(s: []const u8) bool {
+    // U+1F1E6 .. U+1F1FF encode as F0 9F 87 A6 .. F0 9F 87 BF.
+    return s.len == 4 and s[0] == 0xF0 and s[1] == 0x9F and s[2] == 0x87 and
+        s[3] >= 0xA6 and s[3] <= 0xBF;
+}
+
 test "findForbiddenCodepoint: strict profile rejects each forbidden class" {
     const strict_cases = [_][]const u8{
         "a\x01b", // C0 control
@@ -524,4 +556,38 @@ test "isFullyQualifiedEmoji: rejects non-emoji and partial sequences" {
     try std.testing.expect(!isFullyQualifiedEmoji("hello"));
     try std.testing.expect(!isFullyQualifiedEmoji("\u{263A}")); // unqualified
     try std.testing.expect(!isFullyQualifiedEmoji("\u{1F3FB}")); // component
+}
+
+test "canonicalReactionEmoji: canonicalizes every qualification form" {
+    try std.testing.expectEqualStrings("\u{1F44D}", canonicalReactionEmoji("\u{1F44D}").?);
+    try std.testing.expectEqualStrings(
+        "\u{2764}\u{FE0F}",
+        canonicalReactionEmoji("\u{2764}\u{FE0F}").?,
+    );
+    // Unqualified and minimally-qualified forms map to the same sequence.
+    try std.testing.expectEqualStrings("\u{2764}\u{FE0F}", canonicalReactionEmoji("\u{2764}").?);
+    try std.testing.expectEqualStrings(
+        "\u{0031}\u{FE0F}\u{20E3}",
+        canonicalReactionEmoji("\u{0031}\u{20E3}").?,
+    );
+    // A lone regional indicator has no RGI form and is kept as-is.
+    try std.testing.expectEqualStrings("\u{1F1F5}", canonicalReactionEmoji("\u{1F1F5}").?);
+
+    try std.testing.expect(canonicalReactionEmoji("") == null);
+    try std.testing.expect(canonicalReactionEmoji("a") == null);
+    try std.testing.expect(canonicalReactionEmoji("\u{1F44D}\u{1F44D}") == null); // concatenation
+    try std.testing.expect(canonicalReactionEmoji("\u{1F3FB}") == null); // component
+    try std.testing.expect(canonicalReactionEmoji("\u{2764}x") == null);
+}
+
+test "isRegionalIndicator: accepts exactly one regional indicator" {
+    try std.testing.expect(isRegionalIndicator("\u{1F1E6}")); // A
+    try std.testing.expect(isRegionalIndicator("\u{1F1F5}")); // P
+    try std.testing.expect(isRegionalIndicator("\u{1F1FF}")); // Z
+
+    try std.testing.expect(!isRegionalIndicator(""));
+    try std.testing.expect(!isRegionalIndicator("a"));
+    try std.testing.expect(!isRegionalIndicator("\u{1F1E6}\u{1F1F7}")); // AR, a flag
+    try std.testing.expect(!isRegionalIndicator("\u{1F1E5}")); // not an indicator
+    try std.testing.expect(!isRegionalIndicator("\u{1F3FB}")); // component
 }

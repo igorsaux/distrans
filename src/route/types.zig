@@ -149,7 +149,7 @@ pub const Message = struct {
             .edited_at = item.edited_at,
             .embeds = blk: {
                 if (item.embeds) |embeds| {
-                    const embeds_parsed = std.json.parseFromSliceLeaky([]const root.types.Embed, allocator, embeds, .{}) catch |err| {
+                    const embeds_parsed = std.json.parseFromSliceLeaky([]const root.types.Embed, allocator, embeds, .{ .allocate = .alloc_always }) catch |err| {
                         SCOPE.err("bad embeds in DB: {t}", .{err});
 
                         return err;
@@ -179,7 +179,7 @@ pub const Message = struct {
             .pinned = item.pinned,
             .reactions = blk: {
                 if (item.reactions) |reactions| {
-                    const parsed = std.json.parseFromSliceLeaky([]const Reaction, allocator, reactions, .{}) catch |err| {
+                    const parsed = std.json.parseFromSliceLeaky([]const Reaction, allocator, reactions, .{ .allocate = .alloc_always }) catch |err| {
                         SCOPE.err("bad reactions in DB: {t}", .{err});
 
                         return err;
@@ -218,7 +218,7 @@ pub inline fn parseAttachments(
         return &.{};
     }
 
-    const attachments = std.json.parseFromSliceLeaky([]Attachment, allocator, text, .{}) catch |err| {
+    const attachments = std.json.parseFromSliceLeaky([]Attachment, allocator, text, .{ .allocate = .alloc_always }) catch |err| {
         SCOPE.err("failed to parse attachments from DB: {t}", .{err});
 
         return err;
@@ -262,7 +262,7 @@ inline fn parseMentionIds(
         return &.{};
     }
 
-    return std.json.parseFromSliceLeaky([]const []const u8, allocator, text, .{}) catch |err| {
+    return std.json.parseFromSliceLeaky([]const []const u8, allocator, text, .{ .allocate = .alloc_always }) catch |err| {
         SCOPE.err("failed to parse mention ids from DB: {t}", .{err});
 
         return err;
