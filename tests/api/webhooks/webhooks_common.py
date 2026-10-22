@@ -86,6 +86,24 @@ def execute_webhook(http_client, webhook_id, token, payload):
     return http_client.post(f"/api/webhooks/{webhook_id}/{token}", json=payload)
 
 
+def get_webhook_message(http_client, webhook_id, token, message_id):
+    return http_client.get(
+        f"/api/webhooks/{webhook_id}/{token}/messages/{message_id}"
+    )
+
+
+def patch_webhook_message(http_client, webhook_id, token, message_id, payload):
+    return http_client.patch(
+        f"/api/webhooks/{webhook_id}/{token}/messages/{message_id}", json=payload
+    )
+
+
+def delete_webhook_message(http_client, webhook_id, token, message_id):
+    return http_client.delete(
+        f"/api/webhooks/{webhook_id}/{token}/messages/{message_id}"
+    )
+
+
 def insert_file(
     db_conn,
     file_id,

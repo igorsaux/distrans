@@ -61,6 +61,27 @@ pub inline fn handle(
                 .post => return try root.route.webhooks.id.token.executeHandle(allocator, request, response, webhook_id, token),
                 else => return try root.route.generic.methodNotAllowedTask(response, "POST"),
             }
+        } else if (root.utils.eqlMaybe(u8, part, "messages")) {
+            // /api/webhooks/{webhook_id}/{token}/messages/{message_id}
+
+            const message_id_raw = it.next() orelse {
+                return try root.route.generic.notFoundTask(response);
+            };
+
+            const message_id = std.fmt.parseInt(root.types.MessageId, message_id_raw, 10) catch {
+                return try root.route.generic.badRequestTask(response);
+            };
+
+            if (it.next() != null) {
+                return try root.route.generic.notFoundTask(response);
+            }
+
+            switch (request.method) {
+                .get => return try root.route.webhooks.id.messages.getHandle(allocator, request, response, webhook_id, token, message_id),
+                .patch => return try root.route.webhooks.id.messages.patchHandle(allocator, request, response, webhook_id, token, message_id),
+                .delete => return try root.route.webhooks.id.messages.deleteHandle(allocator, request, response, webhook_id, token, message_id),
+                else => return try root.route.generic.methodNotAllowedTask(response, "GET, PATCH, DELETE"),
+            }
         } else if (root.utils.eqlMaybe(u8, part, "github")) {
             // /api/webhooks/{webhook_id}/{token}/github
 

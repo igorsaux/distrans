@@ -401,7 +401,7 @@ def test_post_messages_missing_content(http_client, test_channel, test_session):
     assert response.status_code == 400
 
     body = response.json()
-    assert body["message"] == "'content' is missing"
+    assert body["message"] == "'content' or 'embeds' is required"
 
 
 def test_post_messages_content_not_a_string(http_client, test_channel, test_session):
@@ -422,6 +422,21 @@ def test_post_messages_empty_content(http_client, test_channel, test_session):
 
     body = response.json()
     assert body["message"] == "'content' is empty"
+
+
+def test_post_messages_embeds_only(http_client, test_channel, test_session):
+    response = _post_message(
+        http_client,
+        test_session,
+        test_channel.id,
+        json={"embeds": [{"title": "Only embeds"}]},
+    )
+
+    assert response.status_code == 201, response.content
+
+    message = response.json()
+    assert message["content"] == ""
+    assert message["embeds"][0]["title"] == "Only embeds"
 
 
 def test_post_messages_content_too_long(http_client, test_channel, test_session):

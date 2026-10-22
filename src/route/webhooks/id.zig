@@ -7,6 +7,7 @@ const root = @import("../../root.zig");
 
 pub const avatar = @import("id/avatar.zig");
 pub const github = @import("id/github.zig");
+pub const messages = @import("id/messages.zig");
 pub const token = @import("id/token.zig");
 
 const SCOPE = std.log.scoped(.@"/api/webhooks/{webhook_id}");

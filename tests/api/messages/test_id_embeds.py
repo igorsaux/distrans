@@ -178,6 +178,32 @@ def test_patch_message_keeps_embeds_when_absent(http_client, test_channel, test_
     assert stored.json()["embeds"][0]["title"] == "Kept"
 
 
+def test_patch_message_embeds_only_keeps_content(
+    http_client, test_channel, test_session
+):
+    message_id = _post_message(
+        http_client,
+        test_session,
+        test_channel.id,
+        {"content": "keep me", "embeds": [{"title": "Before"}]},
+    )
+
+    response = _patch_message(
+        http_client,
+        test_session,
+        message_id,
+        {"embeds": [{"title": "After"}]},
+    )
+
+    assert response.status_code == 200, response.content
+
+    stored = _get_message(http_client, test_session, message_id)
+
+    assert stored.status_code == 200
+    assert stored.json()["content"] == "keep me"
+    assert [e["title"] for e in stored.json()["embeds"]] == ["After"]
+
+
 @pytest.mark.parametrize(
     "embeds,message",
     [

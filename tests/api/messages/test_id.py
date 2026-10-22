@@ -348,7 +348,7 @@ def test_patch_message_missing_content(http_client, test_message, test_session):
     assert response.status_code == 400
 
     body = response.json()
-    assert body["message"] == "'content' is missing"
+    assert body["message"] == "'content' or 'embeds' is required"
 
 
 def test_patch_message_content_not_a_string(http_client, test_message, test_session):

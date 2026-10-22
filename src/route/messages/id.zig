@@ -552,33 +552,17 @@ pub inline fn deleteHandle(
 /// R1 - user must be logged
 /// R2 - the message exists
 /// R3 - user must have read_messages on the message's channel and be the author
-/// R4 - "content" must be present, a string, valid UTF-8; forbidden codepoints
-///      are stripped; after stripping the content is not empty and not too long
-/// R5 - optional "embeds" replaces the message embeds; explicit null or an empty
-///      array clears them; a non-empty array is validated like POST R8
-/// R6 - attachments are derived from the new content (same grammar and limit as
-///      POST R9): at most api.messages.max_attachments unique `attachment://`
-///      references, each of which must exist
-/// R7 - mentions are recomputed from the new sanitized content (same syntax and
-///      limits as POST R10); "allowed_mentions" is not accepted on edit because
-///      edits never notify
+/// R4-R7 are enforced by root.services.messages.Edit: the body must contain
+///      "content" and/or "embeds"; content is sanitized and length-checked;
+///      absent fields keep the stored value; the resulting message must have
+///      non-empty content or embeds; attachments and mentions are recomputed
+///      from the effective content. "allowed_mentions" is not accepted on edit
+///      because edits never notify.
 pub const PatchTask = struct {
     pub const Task = root.http.Task;
 
     pub const Payload = struct {
         message_id: root.types.MessageId,
-    };
-
-    const Content = struct {
-        content: []const u8,
-        embeds_mode: root.repo.messages.Edit.Payload.EmbedsMode = .keep,
-        embeds: ?[]const u8 = null,
-        /// Derived from `content`.
-        attachments: []const root.types.FileId = &.{},
-        /// Recomputed from the new content on every edit (default parse = all).
-        mention_everyone: bool = false,
-        mention_user_ids: []const root.types.UserId = &.{},
-        mention_role_ids: []const root.types.RoleId = &.{},
     };
 
     request: *const root.http.Request,
@@ -588,18 +572,7 @@ pub const PatchTask = struct {
     db: ?*root.db.Connection = null,
     message_is_exists_task: ?root.repo.messages.IsExists.Lazy = null,
     check_user_channel_rights_task: ?root.repo.rights.CheckUserChannelRights.Lazy = null,
-    content: ?Content = null,
-    count_attachments_task: ?root.repo.files.CountExisting.Lazy = null,
-    filter_mention_users_task: ?root.repo.mentions.FilterValidUsers.Lazy = null,
-    filter_mention_roles_task: ?root.repo.mentions.FilterValidRoles.Lazy = null,
-    edit_task: ?root.repo.messages.Edit.Lazy = null,
-    get_message_task: ?root.repo.messages.GetOne.Lazy = null,
-    /// The stored message, read back after the edit so the caller can return the
-    /// canonical object (with resolved attachments) to the client.
-    message: ?root.repo.types.Message = null,
-    mentions: root.utils.Mentions = .{},
-    body: ?[]const u8 = null,
-    streamer: ?root.http.Response.Streamer = null,
+    edit_task: ?root.services.messages.Edit.Lazy = null,
 
     fn poll(ctx: *anyopaque) Task.PollT {
         const this: *PatchTask = @ptrCast(@alignCast(ctx));
@@ -673,269 +646,29 @@ pub const PatchTask = struct {
             return root.route.generic.responseErrorMessage(this.response, .forbidden, "Missing permissions");
         }
 
-        // R4
-        if (this.content == null) {
-            if (!this.request.contentIsAvailable()) {
-                return .{ .pending = .want_read };
-            }
-
-            const body = std.json.parseFromSliceLeaky(std.json.Value, this.response.allocator, this.request.getContent(), .{}) catch {
-                _ = root.route.generic.responseErrorMessage(this.response, .bad_request, "Bad JSON");
-
-                return .ready;
-            };
-
-            if (body != .object) {
-                _ = root.route.generic.responseErrorMessage(this.response, .bad_request, "Expected an object");
-
-                return .ready;
-            }
-
-            // R4
-            const content_value = body.object.get("content") orelse {
-                _ = root.route.generic.responseErrorMessage(this.response, .bad_request, "'content' is missing");
-
-                return .ready;
-            };
-
-            // R4
-            if (content_value != .string) {
-                _ = root.route.generic.responseErrorMessage(this.response, .bad_request, "'content' is not a string");
-
-                return .ready;
-            }
-
-            const sanitized = root.unicode.sanitizeMessageText(this.response.allocator, content_value.string) catch |err| switch (err) {
-                error.InvalidUtf8 => return root.route.generic.responseErrorMessage(this.response, .bad_request, "'content' is invalid"),
-                error.OutOfMemory => return .{ .err = error.OutOfMemory },
-            };
-
-            // R4
-            if (sanitized.len == 0) {
-                this.response.allocator.free(sanitized);
-
-                return root.route.generic.responseErrorMessage(this.response, .bad_request, "'content' is empty");
-            }
-
-            // R4
-            if (std.unicode.utf8CountCodepoints(sanitized) catch unreachable >
-                root.options.api.messages.max_codepoints)
-            {
-                this.response.allocator.free(sanitized);
-
-                return root.route.generic.responseErrorMessage(this.response, .bad_request, "'content' is too long");
-            }
-
-            // R5
-            var embeds_mode: root.repo.messages.Edit.Payload.EmbedsMode = .keep;
-            var embeds: ?[]const u8 = null;
-
-            if (body.object.get("embeds")) |embeds_value| {
-                embeds_mode = .set;
-
-                if (embeds_value != .null) {
-                    const parsed = root.utils.parseEmbeds(this.response, embeds_value) catch |err| {
-                        SCOPE.err("PATCH failed to parse the embeds: {t}", .{err});
-
-                        return .{ .err = err };
-                    } orelse {
-                        // response handled in the parser
-                        return .ready;
-                    };
-
-                    if (parsed.items.len != 0) {
-                        embeds = root.utils.serializeEmbeds(this.response.allocator, parsed.items) catch |err| {
-                            SCOPE.err("PATCH failed to serialize the embeds: {t}", .{err});
-
-                            return .{ .err = err };
-                        };
-                    }
-                }
-            }
-
-            // R6
-            const attachment_ids = root.utils.parseAttachmentIds(this.response.allocator, sanitized) catch |err| {
-                SCOPE.err("PATCH failed to parse the attachment ids: {t}", .{err});
-
-                return .{ .err = err };
-            };
-
-            // R6
-            if (attachment_ids.len > root.options.api.messages.max_attachments) {
-                return root.route.generic.responseErrorMessage(this.response, .bad_request, "'attachments' is too long");
-            }
-
-            // R7
-            this.mentions = root.utils.parseMentions(this.response.allocator, sanitized) catch |err| {
-                SCOPE.err("PATCH failed to parse the mentions: {t}", .{err});
-
-                return .{ .err = err };
-            };
-
-            if (this.mentions.user_ids.items.len > root.options.api.messages.max_mention_users or
-                this.mentions.role_ids.items.len > root.options.api.messages.max_mention_roles)
-            {
-                return root.route.generic.responseErrorMessage(this.response, .bad_request, "'mentions' is too long");
-            }
-
-            this.content = .{
-                .content = sanitized,
-                .embeds_mode = embeds_mode,
-                .embeds = embeds,
-                .attachments = attachment_ids,
-                .mention_user_ids = this.mentions.user_ids.items,
-                .mention_role_ids = this.mentions.role_ids.items,
-                .mention_everyone = this.mentions.everyone,
-            };
-        }
-
-        // R7
-        if (this.content.?.mention_user_ids.len != 0) {
-            // await this.filter_mention_users_task
-            {
-                if (this.filter_mention_users_task == null) {
-                    this.filter_mention_users_task = .from(.init(this.response.allocator, this.db.?, .{
-                        .ids = this.content.?.mention_user_ids,
-                    }));
-                }
-
-                while (this.filter_mention_users_task.?.await()) |res| {
-                    return res.discard();
-                }
-
-                this.content.?.mention_user_ids = this.filter_mention_users_task.?.result;
-            }
-        }
-
-        if (this.content.?.mention_role_ids.len != 0) {
-            // await this.filter_mention_roles_task
-            {
-                if (this.filter_mention_roles_task == null) {
-                    this.filter_mention_roles_task = .from(.init(this.response.allocator, this.db.?, .{
-                        .guild_id = this.message_is_exists_task.?.result.?.guild_id,
-                        .ids = this.content.?.mention_role_ids,
-                    }));
-                }
-
-                while (this.filter_mention_roles_task.?.await()) |res| {
-                    return res.discard();
-                }
-
-                this.content.?.mention_role_ids = this.filter_mention_roles_task.?.result;
-            }
-        }
-
-        // R6
-        if (this.content.?.attachments.len != 0) {
-            // await this.count_attachments_task
-            {
-                if (this.count_attachments_task == null) {
-                    this.count_attachments_task = .from(.init(this.response.allocator, this.db.?, .{
-                        .ids = this.content.?.attachments,
-                    }));
-                }
-
-                while (this.count_attachments_task.?.await()) |res| {
-                    return res.discard();
-                }
-
-                if (this.count_attachments_task.?.result != this.content.?.attachments.len) {
-                    return root.route.generic.responseErrorMessage(this.response, .bad_request, "'attachments' is invalid");
-                }
-            }
-        }
-
+        // R4-R7
         // await this.edit_task
         {
             if (this.edit_task == null) {
-                this.edit_task = .from(.init(this.response.allocator, this.db.?, .{
-                    .id = this.payload.message_id,
-                    .content = this.content.?.content,
-                    .embeds_mode = this.content.?.embeds_mode,
-                    .embeds = this.content.?.embeds,
-                    .attachments = this.content.?.attachments,
-                    .mention_everyone = this.content.?.mention_everyone,
-                    .mention_user_ids = this.content.?.mention_user_ids,
-                    .mention_role_ids = this.content.?.mention_role_ids,
-                }));
-            }
-
-            while (!this.edit_task.?.done) {
-                if (this.edit_task.?.await()) |res| {
-                    return res.discard();
-                }
-
-                root.bus.raise(.{
-                    .message_updated = .{
-                        .id = this.payload.message_id,
-                        .channel_id = this.message_is_exists_task.?.result.?.channel_id,
-                        .guild_id = this.message_is_exists_task.?.result.?.guild_id,
-                    },
-                });
-            }
-        }
-
-        // Read the edited message back so the caller gets the canonical object
-        // (with resolved attachments); computed with the author as reaction `me`.
-        if (this.message == null) {
-            if (this.get_message_task == null) {
-                this.get_message_task = .from(.init(
-                    this.response.allocator,
+                this.edit_task = root.services.messages.Edit.lazy(
+                    this.response,
+                    this.request,
                     this.db.?,
                     .{
                         .id = this.payload.message_id,
+                        .guild_id = this.message_is_exists_task.?.result.?.guild_id,
+                        .channel_id = this.message_is_exists_task.?.result.?.channel_id,
                         .me_user_id = this.bearer_middleware_task.?.result.?,
                     },
-                ));
+                );
             }
 
-            while (this.get_message_task.?.await()) |res| {
+            while (this.edit_task.?.await()) |res| {
                 return res.discard();
             }
-
-            this.message = this.get_message_task.?.result;
         }
 
-        if (this.body == null) {
-            const message = this.message orelse {
-                SCOPE.err("PATCH edit task returned no message", .{});
-
-                return .{ .err = error.Unexpected };
-            };
-
-            const response = root.route.types.Message.fromRepo(this.response.allocator, message) catch |err| {
-                SCOPE.err("PATCH failed to build the response message: {t}", .{err});
-
-                return .{ .err = err };
-            };
-
-            var writer: std.Io.Writer.Allocating = .init(this.response.allocator);
-
-            std.json.fmt(response, .{}).format(&writer.writer) catch |err| {
-                SCOPE.err("PATCH failed to serialize the response: {t}", .{err});
-
-                return .{ .err = err };
-            };
-
-            this.body = writer.written();
-        }
-
-        if (this.streamer == null) {
-            var writer = this.response.getWriter();
-
-            if (!writer.writeCode(.ok)) {
-                return .{ .pending = .want_write };
-            }
-
-            if (!writer.beginJSON(this.body.?.len)) {
-                return .{ .pending = .want_write };
-            }
-
-            writer.commit();
-            this.streamer = this.response.getStreamer(this.body.?);
-        }
-
-        return this.streamer.?.poll();
+        return .ready;
     }
 
     fn dispose(ctx: *anyopaque) void {
@@ -956,32 +689,10 @@ pub const PatchTask = struct {
             this.check_user_channel_rights_task = null;
         }
 
-        if (this.count_attachments_task) |*t| {
-            t.dispose();
-            this.count_attachments_task = null;
-        }
-
-        if (this.filter_mention_users_task) |*t| {
-            t.dispose();
-            this.filter_mention_users_task = null;
-        }
-
-        if (this.filter_mention_roles_task) |*t| {
-            t.dispose();
-            this.filter_mention_roles_task = null;
-        }
-
         if (this.edit_task) |*t| {
             t.dispose();
             this.edit_task = null;
         }
-
-        if (this.get_message_task) |*t| {
-            t.dispose();
-            this.get_message_task = null;
-        }
-
-        this.mentions.deinit(this.response.allocator);
 
         if (this.db) |db| {
             db.release();

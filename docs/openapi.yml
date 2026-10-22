@@ -93,7 +93,7 @@ tags:
   - name: emojis
     description: Custom emoji management and icons.
   - name: webhooks
-    description: Webhook management and execution.
+    description: Webhook management, execution and message operations.
   - name: files
     description: File uploads.
   - name: notifications
@@ -2453,16 +2453,18 @@ paths:
     post:
       summary: Send a message (send_messages required)
       description: >-
+        The body must contain non-empty `content` and/or non-empty `embeds`.
         `content` follows `format: message-body`: it must be valid UTF-8;
         forbidden codepoints (controls except \n/\t, BiDi overrides, zero-width,
         tag characters are kept — see the conventions section) are stripped
-        server-side before storage. After stripping, the content must not be
-        empty and must not exceed `api.messages.max_codepoints_per_message`
-        codepoints. An optional `reply_to_id` must reference an existing
-        (not deleted) message in the same channel; a missing, deleted or
-        other-channel target is rejected with 400 "'reply_to_id' is invalid".
-        An optional `embeds` is a list of at most `api.messages.max_embeds`
-        rich embeds (see the `Embed` schema); `null` or `[]` stores no embeds.
+        server-side before storage. After stripping, a content-only message must
+        not be empty and the content must not exceed
+        `api.messages.max_codepoints_per_message` codepoints. An optional
+        `reply_to_id` must reference an existing (not deleted) message in the
+        same channel; a missing, deleted or other-channel target is rejected
+        with 400 "'reply_to_id' is invalid". An optional `embeds` is a list of
+        at most `api.messages.max_embeds` rich embeds (see the `Embed` schema);
+        `null` or `[]` stores no embeds.
         Attachments are derived from `content`: every `attachment://<file_id>`
         reference yields a file id, deduplicated in first-appearance order.
         At most `api.messages.max_attachments` unique
@@ -2477,11 +2479,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [content]
               properties:
                 content:
                   type: string
                   format: message-body
+                  description: >-
+                    Optional when non-empty `embeds` are supplied. A
+                    content-only message must be non-empty after sanitization.
                 reply_to_id:
                   allOf:
                     - $ref: '#/components/schemas/Id'
@@ -2493,7 +2497,8 @@ paths:
                     $ref: '#/components/schemas/Embed'
                   description: >-
                     At most `api.messages.max_embeds`; `null` or an empty array
-                    means no embeds.
+                    means no embeds. A non-empty array may be supplied without
+                    `content`.
                 allowed_mentions:
                   allOf:
                     - $ref: '#/components/schemas/AllowedMentions'
@@ -2514,7 +2519,8 @@ paths:
                 $ref: '#/components/schemas/Message'
         '400':
           description: >-
-            Bad JSON, content missing/not a string/empty/too long (max
+            Bad JSON, neither content nor embeds, content not a string/empty
+            (without embeds)/too long (max
             `api.messages.max_codepoints_per_message` after stripping),
             invalid UTF-8, an invalid reply target, an invalid embed, or a
             content attachment reference that is too many or does not exist
@@ -2880,20 +2886,21 @@ paths:
       summary: Edit a message (author only; read_messages required)
       description: >-
         The caller must have `read_messages` on the message's channel and be
-        the author of the message.
-        `content` follows the same rules as POST /channels/{channel_id}/messages.
-        An optional `embeds` replaces the message's embeds: absent leaves them
-        unchanged, an explicit `null` or an empty array clears them, and a
+        the author of the message. The body must contain `content` and/or
+        `embeds`; an absent field keeps the stored value, and the resulting
+        message must have non-empty content or embeds.
+        `content`, when present, follows the same rules as
+        POST /channels/{channel_id}/messages. An explicit `"embeds": null` or
+        an empty `embeds` array clears the embeds; absent keeps them; a
         non-empty array is validated exactly like POST.
-        Attachments are always derived from `content` and replace the message's
-        attachment set: every `attachment://<file_id>` reference in the new
-        content is a file id (deduplicated, first-appearance order), at most
+        Attachments and mentions are always recomputed from the effective
+        content and replace the message's attachment/mention sets: every
+        `attachment://<file_id>` reference in the content is a file id
+        (deduplicated, first-appearance order), at most
         `api.messages.max_attachments` unique ids, each of which must exist. An
         edit that drops a reference also drops the file association (letting the
-        GC collect it).
-        Mentions (`mention_everyone`, `mentions`, `mention_roles`) are always
-        recomputed from the new `content`; `allowed_mentions` is not accepted on
-        edit because edits never notify.
+        GC collect it). `allowed_mentions` is not accepted on edit because edits
+        never notify.
         Returns the updated message object (the same shape as `GET`).
       tags: [messages]
       operationId: editMessage
@@ -2905,11 +2912,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [content]
               properties:
                 content:
                   type: string
                   format: message-body
+                  description: >-
+                    New content. Absent keeps the current content; when present
+                    it may be empty only if the resulting message has embeds.
                 embeds:
                   type: array
                   nullable: true
@@ -2930,7 +2939,8 @@ paths:
                 $ref: '#/components/schemas/Message'
         '400':
           description: >-
-            Bad JSON, content missing/not a string/empty/too long (max
+            Bad JSON, neither content nor embeds, content not a
+            string/empty (without embeds)/too long (max
             `api.messages.max_codepoints_per_message` after stripping), an
             invalid UTF-8, an invalid embed, or a content attachment reference
             that does not exist
@@ -3531,9 +3541,10 @@ paths:
         permission check (mirroring `POST /channels/{channel_id}/messages`).
         The webhook must exist, not be soft-deleted and `token` must hash to its
         stored `token_hash`; anything else is 404. The body is validated exactly
-        like `POST /channels/{channel_id}/messages` (`content`, `reply_to_id`,
-        `embeds`, `mentions`, `allowed_mentions`, and attachments derived from
-        `content`); the stored message has `author_id` null and `webhook_id` set.
+        like `POST /channels/{channel_id}/messages` (non-empty `content` and/or
+        `embeds`, `reply_to_id`, `mentions`, `allowed_mentions`, and attachments
+        derived from `content`); the stored message has `author_id` null and
+        `webhook_id` set.
         A `message_created` gateway event and push notifications are emitted like
         a user message; the push payload carries the author's `author_id` (null
         for a webhook), `author_name`, `author_avatar_hash` and `webhook_id` so
@@ -3560,11 +3571,13 @@ paths:
           application/json:
             schema:
               type: object
-              required: [content]
               properties:
                 content:
                   type: string
                   format: message-body
+                  description: >-
+                    Optional when non-empty `embeds` are supplied. A
+                    content-only message must be non-empty after sanitization.
                 reply_to_id:
                   allOf:
                     - $ref: '#/components/schemas/Id'
@@ -3574,6 +3587,8 @@ paths:
                   nullable: true
                   items:
                     $ref: '#/components/schemas/Embed'
+                  description: >-
+                    A non-empty array may be supplied without `content`.
                 allowed_mentions:
                   allOf:
                     - $ref: '#/components/schemas/AllowedMentions'
@@ -3587,9 +3602,10 @@ paths:
                 $ref: '#/components/schemas/Message'
         '400':
           description: >-
-            Bad JSON, content missing/not a string/empty/too long, invalid
-            reply target, invalid embed/mention, a missing attachment reference,
-            or an empty body
+            Bad JSON, neither content nor embeds, content not a
+            string/empty (without embeds)/too long, invalid reply target,
+            invalid embed/mention, a missing attachment reference, or an empty
+            body
           content:
             application/json:
               schema:
@@ -3602,6 +3618,143 @@ paths:
                 $ref: '#/components/schemas/Error'
         '415':
           $ref: '#/components/responses/UnsupportedMediaType'
+  /webhooks/{webhook_id}/{token}/messages/{message_id}:
+    parameters:
+      - name: webhook_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Plaintext execute token from webhook creation.
+      - $ref: '#/components/parameters/MessageId'
+    get:
+      summary: Get a webhook message (token-authenticated, no session)
+      description: >-
+        Returns a message previously sent by this webhook. The token is the
+        capability: no session, no bearer auth, no channel permission check.
+        The webhook must exist and not be soft-deleted, and the message must be
+        live, belong to the webhook's channel and carry this `webhook_id`;
+        otherwise 404. The response is the canonical message object, with
+        `webhook_id` set and `author_id` null.
+      tags: [webhooks]
+      operationId: getWebhookMessage
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: Malformed webhook_id or message_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            Webhook not found (unknown, soft-deleted, or bad token) or message
+            not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      summary: Edit a webhook message (token-authenticated, no session)
+      description: >-
+        Edits a message previously sent by this webhook. The webhook and message
+        checks are the same as `GET`. The body must contain `content` and/or
+        `embeds`; an absent field keeps the stored value, an explicit `null` or
+        `[]` clears embeds, and the resulting message must have non-empty
+        content or embeds. Content follows the same sanitization and limits as
+        `PATCH /messages/{message_id}`. Attachments and mentions are recomputed
+        from the effective content; `allowed_mentions` is not accepted on edit
+        because edits never notify. Emits `message_updated` and returns the
+        updated message object.
+      tags: [webhooks]
+      operationId: editWebhookMessage
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                content:
+                  type: string
+                  format: message-body
+                  description: >-
+                    New content. Absent keeps the current content; when present
+                    it may be empty only if the resulting message has embeds.
+                embeds:
+                  type: array
+                  nullable: true
+                  items:
+                    $ref: '#/components/schemas/Embed'
+                  description: >-
+                    Replaces the message embeds. `null` or `[]` clears them;
+                    absent keeps them.
+            example:
+              content: Edited by the webhook
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: >-
+            Bad JSON, neither content nor embeds, invalid content/embeds, or an
+            attachment reference that does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            Webhook not found (unknown, soft-deleted, or bad token) or message
+            not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+    delete:
+      summary: Delete a webhook message (token-authenticated, no session)
+      description: >-
+        Soft-deletes a message previously sent by this webhook. The webhook and
+        message checks are the same as `GET`. Emits `message_deleted` and
+        returns 204. Deleting the same message twice returns 404 the second
+        time.
+      tags: [webhooks]
+      operationId: deleteWebhookMessage
+      security: []
+      responses:
+        '204':
+          description: No Content
+        '400':
+          description: Malformed webhook_id or message_id
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: >-
+            Webhook not found (unknown, soft-deleted, or bad token) or message
+            not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /webhooks/{webhook_id}/{token}/github:
     post:
       summary: Execute a GitHub-compatible webhook (token-authenticated, no session)

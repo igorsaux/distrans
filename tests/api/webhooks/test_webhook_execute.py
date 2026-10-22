@@ -121,7 +121,25 @@ def test_execute_missing_content(http_client, test_guild, test_channel):
     response = execute_webhook(http_client, created["id"], created["token"], {})
 
     assert response.status_code == 400
-    assert response.json()["message"] == "'content' is missing"
+    assert response.json()["message"] == "'content' or 'embeds' is required"
+
+
+# R3 - embeds alone are a valid message body
+def test_execute_embeds_only(http_client, test_guild, test_channel, test_session):
+    created = create_webhook(
+        http_client, test_guild.admin_token, test_channel.id, name="hook"
+    )
+
+    response = execute_webhook(
+        http_client,
+        created["id"],
+        created["token"],
+        {"embeds": [{"title": "Only embeds"}]},
+    )
+
+    assert response.status_code == 201, response.content
+    assert response.json()["content"] == ""
+    assert response.json()["embeds"][0]["title"] == "Only embeds"
 
 
 # R4 - a plain message is stored as the webhook
