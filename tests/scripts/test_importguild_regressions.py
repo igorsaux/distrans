@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -166,7 +167,9 @@ def test_import_preserves_dump_message_updated_at():
 
     importguild.flush_messages(cur, counters)
 
-    insert = next(query for query in cur.queries if query.startswith("INSERT INTO app.messages"))
+    insert = next(
+        query for query in cur.queries if "INSERT INTO app.messages" in query
+    )
     assert "updated_at" in insert
     assert "COALESCE(i.edited_at, i.created_at)" in insert
 
@@ -194,3 +197,384 @@ def test_reaction_emoji_canonicalized_to_fully_qualified():
     )
 
     assert rows == [(5, 1, 0, None, "\u2764\ufe0f"), (5, 2, 0, None, "\U0001f1f5")]
+
+
+def test_iter_downloads_submits_only_a_bounded_window():
+    from concurrent.futures import ThreadPoolExecutor
+
+    submitted = []
+
+    def fetch(entry):
+        submitted.append(entry)
+        return entry, b"", None
+
+    window = 3
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        downloads = importguild.iter_downloads(pool, fetch, range(100), window)
+
+        for consumed in range(1, 21):
+            entry, data, error = next(downloads)
+            assert data == b""
+            assert error is None
+            # A completed download is never buffered beyond the window.
+            assert consumed <= len(submitted) <= consumed + window
+
+        downloads.close()
+
+    assert len(submitted) < 100
+
+
+def test_process_attachments_reuses_existing_file_without_download(monkeypatch):
+    import time
+
+    downloads = []
+    monkeypatch.setattr(
+        importguild, "download_bytes", lambda url: downloads.append(url) or b"bytes"
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.rowcount = 0
+            self._rows = []
+            self.inserts = []
+
+        def execute(self, query, params=None):
+            if query.startswith("SELECT message_id, position"):
+                self._rows = []
+            elif query.startswith("SELECT id, content_type FROM app.files"):
+                self._rows = [(55, "image/png")]
+            elif query.startswith("SELECT content"):
+                self._rows = [("hello",)]
+            elif query.startswith("INSERT INTO app.message_attachments"):
+                self._rows = []
+                self.rowcount = 1
+                self.inserts.append(params)
+            else:
+                self._rows = []
+                self.rowcount = 1
+
+        def fetchall(self):
+            return self._rows
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+    class Connection:
+        def __init__(self):
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    expires = format(int(time.time()) + 3600, "x")
+    attachment = {
+        "id": 55,
+        "url": f"https://cdn.discordapp.com/attachments/1/55/a.png?ex={expires}",
+        "filename": "a.png",
+        "size": 10,
+    }
+
+    cur = Cursor()
+    conn = Connection()
+    counters = {
+        "attachments_reused": 0,
+        "attachments_linked": 0,
+        "attachments_skipped_existing": 0,
+        "attachments_skipped_host": 0,
+        "attachments_skipped_download": 0,
+        "attachments_skipped_expired": 0,
+    }
+
+    importguild.process_attachments(
+        conn, cur, None, 1, [(10, 0, attachment)], counters
+    )
+
+    assert downloads == []
+    assert counters["attachments_reused"] == 1
+    assert cur.inserts == [(10, 55, 0, 10, 55, 10, 0, 55)]
+    assert conn.commits >= 1
+
+
+def test_previous_report_state_keeps_tokens_and_valid_markers(tmp_path):
+    path = tmp_path / "report.json"
+    path.write_text(
+        json.dumps(
+            {
+                "webhook_tokens": {"7": "token", "8": 5},
+                "completed_channels": {
+                    "1": {"size": 10, "mtime": 20, "attachments": True},
+                    "2": {"size": "10", "mtime": 20},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    previous = importguild.load_previous_report(str(path))
+
+    assert importguild.previous_webhook_tokens(previous) == {"7": "token"}
+    assert importguild.previous_completed_channels(previous) == {
+        "1": {
+            "size": 10,
+            "mtime": 20,
+            "attachments": True,
+            "attachments_skipped": 0,
+        }
+    }
+
+
+def test_load_previous_report_tolerates_missing_or_broken_file(tmp_path):
+    assert importguild.load_previous_report(str(tmp_path / "missing.json")) == {}
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+
+    assert importguild.load_previous_report(str(broken)) == {}
+
+
+def test_import_message_file_streams_bytes_and_reports_progress(tmp_path):
+    message = {
+        "id": 501,
+        "channel_id": 1,
+        "author_id": 7,
+        "author_name": "alice",
+        "content": "hello",
+        "created_at": "2024-01-01T00:00:00+00:00",
+        "mentions": [],
+        "attachments": [],
+        "embeds": [],
+        "reactions": [],
+    }
+    path = tmp_path / "1.jsonl"
+    path.write_bytes(
+        json.dumps(message).encode("utf-8")
+        + b"\n"
+        + b'{"id": 502, "content": "\xff"}\n'
+    )
+
+    class Copy:
+        def __init__(self):
+            self.rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def write_row(self, row):
+            self.rows.append(row)
+
+    class Cursor:
+        def __init__(self):
+            self.copies = []
+
+        def copy(self, sql):
+            copy = Copy()
+            self.copies.append((sql, copy))
+            return copy
+
+        def execute(self, *_args):
+            return None
+
+    cur = Cursor()
+    counters = {
+        "malformed_lines": [],
+        "legacy_mentions_normalized": 0,
+        "message_links_rewritten": 0,
+        "gif_embeds_replaced": 0,
+        "gif_links_unresolved": 0,
+        "messages_skipped_empty": 0,
+        "embeds_skipped_too_many": 0,
+        "reactions_skipped_empty": 0,
+        "reactions_skipped_foreign": 0,
+    }
+    progress = []
+
+    written, attachments = importguild.import_message_file(
+        cur,
+        100,
+        1,
+        str(path),
+        importguild.UserCache(),
+        set(),
+        {7},
+        set(),
+        set(),
+        {},
+        importguild.Usernames(set()),
+        set(),
+        10,
+        counters,
+        progress=lambda count, done: progress.append((count, done)),
+    )
+
+    assert written == 1
+    assert attachments == []
+    assert counters["malformed_lines"] == [f"{path}:2"]
+    assert progress[-1] == (1, path.stat().st_size)
+    rows = cur.copies[0][1].rows
+    assert len(rows) == 1
+    assert rows[0][0] == 501
+    assert rows[0][4] == "hello"
+
+
+def test_import_webhooks_reports_only_lost_generated_tokens():
+    class Cursor:
+        rowcount = 0
+
+        def execute(self, *_args):
+            self.rowcount = 0
+
+    webhook_dump = {
+        3000: {"token": "from-dump", "channel_id": 2001, "name": "incoming"},
+        3001: {"token": None, "channel_id": 2001, "name": "follower"},
+    }
+    counters = {
+        "webhooks_imported": 0,
+        "webhooks_skipped_channel": 0,
+        "webhook_tokens": {},
+        "webhook_tokens_unknown": [],
+    }
+
+    known = importguild.import_webhooks(
+        Cursor(), 999, webhook_dump, {2001}, counters
+    )
+
+    # Both rows already exist from the interrupted run. Only the webhook whose
+    # token was generated (not taken from the dump) has an unrecoverable
+    # plaintext token.
+    assert known == {3000, 3001}
+    assert counters["webhook_tokens_unknown"] == ["3001"]
+    assert counters["webhook_tokens"] == {}
+
+    counters["webhook_tokens_unknown"] = []
+    counters["webhook_tokens"] = {"3001": "recorded"}
+
+    importguild.import_webhooks(Cursor(), 999, webhook_dump, {2001}, counters)
+
+    assert counters["webhook_tokens_unknown"] == []
+
+
+def test_flush_messages_returns_ids_for_incremental_import():
+    class Cursor:
+        rowcount = 0
+
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, query, *_args):
+            self.queries.append(query)
+            self.rowcount = 0
+
+        def fetchall(self):
+            return [(501, None), (502, 3000)]
+
+        def fetchone(self):
+            return (0,)
+
+    counters = {
+        "messages_inserted": 0,
+        "messages_webhook": 0,
+        "messages_pinned": 0,
+        "embeds_inserted": 0,
+        "replies_linked": 0,
+        "replies_dropped": 0,
+    }
+
+    ids = importguild.flush_messages(Cursor(), counters, return_ids=True)
+
+    assert ids == {501, 502}
+    assert counters["messages_inserted"] == 2
+    assert counters["messages_webhook"] == 1
+
+
+def test_process_attachments_incremental_skips_old_messages(monkeypatch):
+    import time
+
+    downloads = []
+    monkeypatch.setattr(
+        importguild, "download_bytes", lambda url: downloads.append(url) or b"bytes"
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.rowcount = 0
+            self._rows = []
+
+        def execute(self, query, params=None):
+            if query.startswith("SELECT message_id, position"):
+                self._rows = []
+            elif query.startswith("SELECT id, content_type FROM app.files"):
+                self._rows = []
+            elif query.startswith("SELECT content"):
+                self._rows = [("hello",)]
+            else:
+                self._rows = []
+                self.rowcount = 1
+
+        def fetchall(self):
+            return self._rows
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+    class Connection:
+        def __init__(self):
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    class S3:
+        def available(self):
+            return True
+
+        def put(self, *_args, **_kwargs):
+            return True
+
+    expires = format(int(time.time()) + 3600, "x")
+
+    def attachment(att_id):
+        return {
+            "id": att_id,
+            "url": f"https://cdn.discordapp.com/attachments/1/{att_id}/a.png?ex={expires}",
+            "filename": "a.png",
+            "size": 10,
+        }
+
+    counters = {
+        "warnings": [],
+        "attachments_uploaded": 0,
+        "attachments_linked": 0,
+        "attachments_reused": 0,
+        "attachments_skipped_incremental": 0,
+        "attachments_skipped_existing": 0,
+        "attachments_skipped_host": 0,
+        "attachments_skipped_download": 0,
+        "attachments_skipped_expired": 0,
+        "attachment_bytes_uploaded": 0,
+        "s3_puts": 0,
+    }
+
+    cur = Cursor()
+    conn = Connection()
+
+    importguild.process_attachments(
+        conn,
+        cur,
+        S3(),
+        1,
+        [(10, 0, attachment(100)), (11, 0, attachment(101))],
+        counters,
+        message_filter={11},
+    )
+
+    # Only the attachment of the newly inserted message is downloaded; the old
+    # message's never-linked attachment is reported, not retried.
+    assert len(downloads) == 1
+    assert "101" in downloads[0]
+    assert counters["attachments_skipped_incremental"] == 1
+    assert counters["attachments_linked"] == 1
+    assert any("--refresh-messages" in warning for warning in counters["warnings"])

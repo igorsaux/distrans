@@ -106,12 +106,12 @@ class Discord:
     def get_message(self, channel_id, message_id):
         return self._request("GET", f"/channels/{channel_id}/messages/{message_id}")
 
-    def refresh_attachment_urls(self, urls):
+    def refresh_attachment_urls(self, urls, progress=None):
         """Re-sign up to 50 attachment URLs via ``POST /attachments/refresh-urls``.
 
         Returns ``{old_url: new_url}`` for the URLs Discord could re-sign; the
         endpoint is bot-token only and refreshes the signed query string in one
-        round trip.
+        round trip. ``progress(done, total)`` is called after each batch.
         """
         mapping = {}
 
@@ -120,6 +120,9 @@ class Discord:
             payload = self._request(
                 "POST", "/attachments/refresh-urls", json={"attachment_urls": batch}
             )
+
+            if progress is not None:
+                progress(min(start + len(batch), len(urls)), len(urls))
 
             if not payload:
                 continue

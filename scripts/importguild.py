@@ -121,6 +121,17 @@ USER FRESHNESS
     ``--refresh-users`` to overwrite their `username` and `display_name` from the
     dump (never `is_bot`, `password_hash`, `deleted_at` or avatars).
 
+RESUMING
+    Work is committed per channel: messages and webhook placeholders before the
+    attachment phase, attachments in checkpointed batches. The report is
+    rewritten after every checkpoint and is the only place generated webhook
+    tokens exist, so it also recovers them on a re-run. A channel whose dump
+    file is unchanged and whose previous run completed (attachments included,
+    when they are enabled) is skipped; a changed file, an interrupted channel,
+    `--limit` and `--refresh-messages` replay the normal idempotent flow.
+    Already stored files and links are reused, never re-downloaded; an
+    incremental replay only considers attachments of newly inserted messages.
+
 WHAT IS SKIPPED
     * channels of type voice and forum (no equivalent / not messageable)
     * reactions with an empty captured user list, and reaction users that are not
@@ -160,14 +171,29 @@ ATTACHMENTS
       * `--attachments-blacklist IDS` - all channels except these.
     The two are mutually exclusive; the whitelist wins when both are empty.
 
-    Existing bytes are never re-downloaded: a message/position already linked, or
-    a file id already present, or a hash already stored, is reused. The
+    Downloads run in a bounded window (a few files at a time) and are stored and
+    linked in checkpointed batches (every 100 attachments or 30 seconds). This
+    keeps memory proportional to the window instead of to the channel, and an
+    interrupted run resumes inside a large channel instead of re-downloading all
+    of it. Messages are committed before the attachment phase for the same
+    reason. The report is rewritten after every checkpoint, so generated webhook
+    tokens survive a crash.
+
+    A channel completed by an earlier run is imported incrementally: only the
+    attachments of messages inserted by this run are checked. Attachments that an
+    earlier run skipped (expired URL, failed download) are recorded on the
+    channel marker and in the report, but are not retried automatically;
+    ``--refresh-messages`` is the explicit backfill. This is what keeps a fetch of
+    one new message from re-checking the whole channel's attachment history.
+
+    Existing bytes are never re-downloaded: a message/position already linked, a
+    file id already present, or a hash already stored, is reused. The
     `app.message_attachments` link is written in the same transaction as the
     `app.files` row, so an interrupted run cannot leave a committed file without
     its link. When the file row already exists but the link does not, the link is
-    (re-)created without re-downloading, so re-running with `--refresh-messages`
-    repairs orphans left by older versions of this script (which staged links in
-    a temp table and only flushed them at the very end, losing them on a crash).
+    (re-)created without re-downloading, so re-running repairs orphans left by
+    older versions of this script (which staged links in a temp table and only
+    flushed them at the very end, losing them on a crash).
 
 AVATARS
     Discord CDN images are downloaded and re-encoded locally with the configured
@@ -222,6 +248,7 @@ import secrets
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.parse
 
 import psycopg
@@ -324,6 +351,21 @@ MAX_EMBED_COLOR = 0xFFFFFF
 AVATAR_CONCURRENCY = 8
 ATTACHMENT_CONCURRENCY = 8
 EMOJI_CONCURRENCY = 8
+
+# Attachments are downloaded in a bounded window: `ThreadPoolExecutor.map`
+# submits every task at once and keeps every completed download in memory until
+# the (serial, slower) S3 upload consumes it, which for a channel with tens of
+# thousands of attachments is tens of gigabytes. The window caps how many
+# downloads may be in flight (and therefore buffered) at a time.
+ATTACHMENT_WINDOW = ATTACHMENT_CONCURRENCY
+
+# Checkpoint links every N stored attachments (and at least every interval), so
+# an interrupted run keeps the work it already did instead of rolling the whole
+# channel back.
+ATTACHMENT_COMMIT_BATCH = 100
+ATTACHMENT_COMMIT_INTERVAL_S = 30.0
+
+PROGRESS_INTERVAL_S = 1.0
 
 # Webhook execute token size (mirror src/services/tokens.zig::generateWebhookToken).
 WEBHOOK_TOKEN_BYTES = 32
@@ -478,6 +520,178 @@ def parse_timestamp(value):
         parsed = parsed.replace(tzinfo=datetime.timezone.utc)
 
     return parsed
+
+
+def format_bytes(value):
+    value = float(value or 0)
+
+    if value < 1024:
+        return f"{int(value)} B"
+
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        value /= 1024.0
+
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+
+    return f"{seconds}s"
+
+
+class StatusLine:
+    """Single-line status output; periodic lines when stdout is not a TTY."""
+
+    def __init__(self, enabled=True, stream=None, interval=PROGRESS_INTERVAL_S):
+        self.stream = stream or sys.stdout
+        self.enabled = enabled
+        self.tty = self.stream.isatty()
+        self.interval = interval if self.tty else max(10.0, interval)
+        self.last_update = 0.0
+        self.length = 0
+
+    def update(self, text, force=False):
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+
+        if not force and now - self.last_update < self.interval:
+            return
+
+        self.last_update = now
+
+        if self.tty:
+            padding = " " * max(0, self.length - len(text))
+            self.stream.write(f"\r{text}{padding}")
+            self.length = len(text)
+        else:
+            self.stream.write(f"{text}\n")
+
+        self.stream.flush()
+
+    def done(self, text=None):
+        if not self.enabled:
+            return
+
+        if text:
+            self.update(text, force=True)
+
+        if self.tty and self.length:
+            self.stream.write("\n")
+            self.stream.flush()
+            self.length = 0
+
+
+class ImportProgress:
+    """Channel-oriented progress for the message and attachment phases."""
+
+    def __init__(self, total_files, status=None):
+        self.total_files = total_files
+        self.status = status or StatusLine()
+        self.index = 0
+        self.channel_id = None
+        self.name = ""
+        self.size = 0
+        self.written = 0
+        self.started = 0.0
+        self.attachment_started = 0.0
+
+    def _prefix(self):
+        return f"[{self.index}/{self.total_files}] #{self.name} ({self.channel_id})"
+
+    def begin_channel(self, index, channel_id, name, size):
+        self.index = index
+        self.channel_id = channel_id
+        self.name = name or f"channel-{channel_id}"
+        self.size = size or 0
+        self.written = 0
+        self.started = time.monotonic()
+        self.attachment_started = self.started
+        self.status.update(f"{self._prefix()}  0.0%  0 msgs", force=True)
+
+    def messages(self, written, done_bytes):
+        self.written = written
+        elapsed = time.monotonic() - self.started
+        percent = (done_bytes / self.size * 100.0) if self.size else 100.0
+        rate = (done_bytes / elapsed) if elapsed > 0 else 0.0
+        eta = (
+            (self.size - done_bytes) / rate
+            if rate > 0 and self.size > done_bytes
+            else 0.0
+        )
+        line = (
+            f"{self._prefix()}  {percent:5.1f}%  {written:,} msgs  "
+            f"{format_bytes(done_bytes)}/{format_bytes(self.size)}"
+        )
+
+        if eta:
+            line += f"  ETA {format_duration(eta)}"
+
+        self.status.update(line)
+
+    def finish_messages(self, written):
+        self.written = written
+        self.attachment_started = time.monotonic()
+        self.status.update(
+            f"{self._prefix()}  messages: {written:,}  "
+            f"in {format_duration(time.monotonic() - self.started)}",
+            force=True,
+        )
+
+    def refresh(self, done, total):
+        self.status.update(
+            f"{self._prefix()}  refreshing expired attachment URLs  "
+            f"{done:,}/{total:,}"
+        )
+
+    def attachments(self, done, total, done_bytes, total_bytes):
+        elapsed = time.monotonic() - self.attachment_started
+        percent = (done / total * 100.0) if total else 100.0
+        rate = (done_bytes / elapsed) if elapsed > 0 else 0.0
+        eta = (
+            (total_bytes - done_bytes) / rate
+            if rate > 0 and total_bytes > done_bytes
+            else 0.0
+        )
+        line = (
+            f"{self._prefix()}  attachments {done:,}/{total:,} "
+            f"({percent:.1f}%)  "
+            f"{format_bytes(done_bytes)}/{format_bytes(total_bytes)}"
+        )
+
+        if eta:
+            line += f"  ETA {format_duration(eta)}"
+
+        self.status.update(line)
+
+    def complete(self, attachment_count):
+        self.status.done(
+            f"[{self.index}/{self.total_files}] #{self.name} ({self.channel_id}): "
+            f"{self.written:,} messages, {attachment_count:,} attachments"
+        )
+
+    def skipped(self):
+        self.status.done(
+            f"[{self.index}/{self.total_files}] #{self.name} ({self.channel_id}): "
+            "already imported (unchanged)"
+        )
+
+    def failed(self, error):
+        self.status.done(
+            f"[{self.index}/{self.total_files}] #{self.name} ({self.channel_id}): "
+            f"FAILED: {error}"
+        )
 
 
 def iter_jsonl(path, report):
@@ -1423,6 +1637,15 @@ def load_webhook_dump(guild_dir, report):
     return webhooks
 
 
+def mark_unknown_webhook_token(report, webhook_id):
+    """Record a webhook whose generated token was lost with an earlier run."""
+    value = str(webhook_id)
+    unknown = report["webhook_tokens_unknown"]
+
+    if value not in unknown:
+        unknown.append(value)
+
+
 def import_webhooks(cur, guild_id, webhook_dump, imported_channel_ids, report):
     """Insert ``app.webhooks`` rows for the dump's webhooks on imported channels.
 
@@ -1449,7 +1672,15 @@ def import_webhooks(cur, guild_id, webhook_dump, imported_channel_ids, report):
         generated = token is None
 
         if generated:
-            token = secrets.token_urlsafe(WEBHOOK_TOKEN_BYTES)
+            # A re-run may already have recorded a generated token; reuse it
+            # instead of generating (and losing) another one.
+            recorded = report["webhook_tokens"].get(str(webhook_id))
+
+            if recorded is not None:
+                token = recorded
+                generated = False
+            else:
+                token = secrets.token_urlsafe(WEBHOOK_TOKEN_BYTES)
 
         rows.append(
             (
@@ -1474,6 +1705,10 @@ def import_webhooks(cur, guild_id, webhook_dump, imported_channel_ids, report):
 
             if plaintext is not None:
                 report["webhook_tokens"][str(webhook_id)] = plaintext
+        elif plaintext is not None and str(webhook_id) not in report["webhook_tokens"]:
+            # The row was created by an interrupted run that never persisted
+            # its generated token; its plaintext is unrecoverable.
+            mark_unknown_webhook_token(report, webhook_id)
 
     return {row[0] for row in rows}
 
@@ -1513,6 +1748,11 @@ def create_webhook_placeholders(cur, guild_id, pending, known_webhook_ids, repor
             known_webhook_ids.add(webhook_id)
             report["webhook_placeholders_created"] += 1
             report["webhook_tokens"][str(webhook_id)] = token
+        else:
+            known_webhook_ids.add(webhook_id)
+
+            if str(webhook_id) not in report["webhook_tokens"]:
+                mark_unknown_webhook_token(report, webhook_id)
 
 
 def import_emojis(cur, guild_id, emoji_dump, limits, min_codepoints, max_codepoints, refresh, report, state):
@@ -1964,17 +2204,22 @@ def sync_avatars(conn, cur, guild_id, guild, cache, limits, refresh, report):
 def import_message_file(
     cur, guild_id, channel_id, path, cache, member_ids, known_user_ids, inserted_user_ids,
     known_webhook_ids, pending_webhooks, usernames, deleted_ids, max_embeds, report,
-    want_attachments=False, guild_emoji_ids=frozenset(), emoji_canonical=None
+    want_attachments=False, guild_emoji_ids=frozenset(), emoji_canonical=None,
+    progress=None,
 ):
     pending_users = set()
     staged_attachments = []
     staged_reactions = []
     written = 0
+    processed_bytes = 0
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    with open(path, "r", encoding="utf-8") as f:
+    # Binary mode: `len(line)` is an exact byte count for progress and
+    # `json.loads` accepts bytes, so the file is never decoded twice.
+    with open(path, "rb") as f:
         with cur.copy(MESSAGE_COPY_SQL) as copy:
             for line_no, line in enumerate(f, 1):
+                processed_bytes += len(line)
                 line = line.strip()
 
                 if not line:
@@ -1982,7 +2227,7 @@ def import_message_file(
 
                 try:
                     message = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     report["malformed_lines"].append(f"{path}:{line_no}")
 
                     continue
@@ -2048,6 +2293,12 @@ def import_message_file(
                     for position, attachment in enumerate(message.get("attachments") or []):
                         staged_attachments.append((message_id, position, attachment))
 
+                if progress is not None and line_no % 8192 == 0:
+                    progress(written, processed_bytes)
+
+    if progress is not None:
+        progress(written, processed_bytes)
+
     if staged_reactions:
         with cur.copy(REACTION_COPY_SQL) as copy:
             for row in staged_reactions:
@@ -2068,27 +2319,47 @@ def import_message_file(
     return written, staged_attachments
 
 
-def flush_messages(cur, report):
-    cur.execute(
-        "INSERT INTO app.messages"
-        " (id, channel_id, guild_id, author_id, webhook_id, content, created_at, edited_at, updated_at, embeds, pinned)"
-        " SELECT i.id, i.channel_id, c.guild_id, i.author_id, i.webhook_id, i.content, i.created_at,"
-        "        i.edited_at, COALESCE(i.edited_at, i.created_at), i.embeds, COALESCE(i.pinned, false)"
-        " FROM import_messages i"
-        " JOIN app.channels c ON c.id = i.channel_id"
-        " WHERE NOT EXISTS (SELECT 1 FROM app.messages m WHERE m.id = i.id)"
-        " RETURNING id, webhook_id"
+def flush_messages(cur, report, return_ids=False):
+    """Insert staged messages and return the ids inserted by this run.
+
+    With ``return_ids`` the newly inserted ids are returned so an incremental
+    import can process attachments of the new messages only. For a fresh
+    channel there are millions of ids, so the default path aggregates inside
+    SQL instead of buffering them on the client.
+    """
+    insert_sql = (
+        "WITH inserted AS ("
+        "  INSERT INTO app.messages"
+        "  (id, channel_id, guild_id, author_id, webhook_id, content, created_at, edited_at, updated_at, embeds, pinned)"
+        "  SELECT i.id, i.channel_id, c.guild_id, i.author_id, i.webhook_id, i.content, i.created_at,"
+        "         i.edited_at, COALESCE(i.edited_at, i.created_at), i.embeds, COALESCE(i.pinned, false)"
+        "  FROM import_messages i"
+        "  JOIN app.channels c ON c.id = i.channel_id"
+        "  WHERE NOT EXISTS (SELECT 1 FROM app.messages m WHERE m.id = i.id)"
+        "  RETURNING id, webhook_id"
+        ")"
     )
-    inserted_message_ids = set()
-    webhook_messages = 0
 
-    for row in cur.fetchall():
-        inserted_message_ids.add(int(row[0]))
+    inserted_ids = set()
 
-        if row[1] is not None:
-            webhook_messages += 1
+    if return_ids:
+        cur.execute(insert_sql + " SELECT id, webhook_id FROM inserted")
+        webhook_messages = 0
 
-    report["messages_inserted"] += len(inserted_message_ids)
+        for row in cur.fetchall():
+            inserted_ids.add(int(row[0]))
+
+            if row[1] is not None:
+                webhook_messages += 1
+
+        inserted = len(inserted_ids)
+    else:
+        cur.execute(insert_sql + " SELECT count(*), count(webhook_id) FROM inserted")
+        row = cur.fetchone() or (0, 0)
+        inserted = int(row[0])
+        webhook_messages = int(row[1]) if len(row) > 1 else 0
+
+    report["messages_inserted"] += inserted
     report["messages_webhook"] += webhook_messages
 
     # Backfill pins on re-runs, fill-only: add a pin the dump has but the DB
@@ -2134,7 +2405,7 @@ def flush_messages(cur, report):
     )
     report["replies_dropped"] += cur.fetchone()[0]
 
-    return inserted_message_ids
+    return inserted_ids
 
 
 def clear_import_staging(cur):
@@ -2208,7 +2479,7 @@ def guess_content_type(attachment):
     return guessed or "application/octet-stream"
 
 
-def refresh_expired_urls(client, channel_id, candidates, report):
+def refresh_expired_urls(client, channel_id, candidates, report, progress=None):
     """Re-sign expired CDN URLs and point the candidates at the fresh ones.
 
     Uses the bot-only ``POST /attachments/refresh-urls`` batch endpoint (50 URLs
@@ -2239,7 +2510,7 @@ def refresh_expired_urls(client, channel_id, candidates, report):
             unique_urls.append(url)
 
     try:
-        mapping = client.refresh_attachment_urls(unique_urls)
+        mapping = client.refresh_attachment_urls(unique_urls, progress=progress)
     except DiscordError as e:
         report["warnings"].append(
             f"channel {channel_id}: failed to refresh attachment URLs: {e}"
@@ -2260,7 +2531,9 @@ def refresh_expired_urls(client, channel_id, candidates, report):
     refreshed = len(expired) - len(unresolved)
 
     if unresolved:
-        still = refresh_urls_per_message(client, channel_id, unresolved, report)
+        still = refresh_urls_per_message(
+            client, channel_id, unresolved, report, progress=progress
+        )
         refreshed -= len(still)
         unresolved = still
 
@@ -2270,35 +2543,53 @@ def refresh_expired_urls(client, channel_id, candidates, report):
     return unresolved
 
 
-def refresh_urls_per_message(client, channel_id, entries, report):
-    """Fallback: fetch the affected messages individually to find fresh URLs."""
+def refresh_urls_per_message(client, channel_id, entries, report, progress=None):
+    """Fallback: fetch the affected messages individually to find fresh URLs.
+
+    Messages are fetched in small chunks so the full REST payloads of a channel
+    with tens of thousands of attachments are never held in memory at once.
+    Progress is reported through ``progress`` so a long fallback is visible.
+    """
     by_message = {}
 
     for entry in entries:
         by_message.setdefault(entry[0], []).append(entry)
 
-    fetched = {}
-
-    for message_id in by_message:
-        try:
-            fetched[message_id] = client.get_message(channel_id, message_id)
-        except Exception as e:  # noqa: BLE001 - a closed channel is a skip
-            report["warnings"].append(
-                f"message {message_id}: failed to refresh attachment URL: {e}"
-            )
-            fetched[message_id] = None
-
+    messages = list(by_message.items())
+    total = sum(len(group) for _mid, group in messages)
+    done = 0
     unresolved = []
+    chunk_size = 25
 
-    for entry in entries:
-        message_id, position, att_id, att = entry
-        message = fetched.get(message_id)
-        fresh = fresh_attachment_urls(message) if message is not None else {}
+    for start in range(0, len(messages), chunk_size):
+        chunk = messages[start : start + chunk_size]
+        fetched = {}
 
-        if att_id in fresh:
-            att["url"] = fresh[att_id]
-        else:
-            unresolved.append(entry)
+        for message_id, _group in chunk:
+            try:
+                fetched[message_id] = client.get_message(channel_id, message_id)
+            except Exception as e:  # noqa: BLE001 - a closed channel is a skip
+                report["warnings"].append(
+                    f"message {message_id}: failed to refresh attachment URL: {e}"
+                )
+                fetched[message_id] = None
+
+        for message_id, message_entries in chunk:
+            message = fetched.pop(message_id)
+            fresh = fresh_attachment_urls(message) if message is not None else {}
+
+            for entry in message_entries:
+                _message_id, _position, att_id, att = entry
+
+                if att_id in fresh:
+                    att["url"] = fresh[att_id]
+                else:
+                    unresolved.append(entry)
+
+            done += len(message_entries)
+
+            if progress is not None:
+                progress(done, total)
 
     return unresolved
 
@@ -2497,7 +2788,57 @@ def backfill_attachment_tokens(cur):
     append_attachment_tokens(cur, cur.fetchall())
 
 
-def process_attachments(cur, s3, channel_id, attachments, report, discord_client=None, message_filter=None):
+def attachment_size(attachment):
+    size = attachment.get("size")
+
+    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        return size
+
+    return 0
+
+
+def iter_downloads(pool, fetch, entries, window):
+    """Yield ``(entry, data, error)`` keeping at most ``window`` downloads live.
+
+    ``ThreadPoolExecutor.map`` submits the whole iterable at once and stores
+    every completed result until the consumer reaches it. With a slow consumer
+    (a serial S3 upload plus DB writes) and a channel holding tens of thousands
+    of attachments, that accumulates the channel's entire byte size in memory.
+    This bounded window keeps memory proportional to the window, not to the
+    channel.
+    """
+    from concurrent.futures import FIRST_COMPLETED, wait
+
+    pending = {}
+    iterator = iter(entries)
+
+    def submit_next():
+        try:
+            entry = next(iterator)
+        except StopIteration:
+            return False
+
+        pending[pool.submit(fetch, entry)] = entry
+
+        return True
+
+    for _ in range(max(1, window)):
+        if not submit_next():
+            break
+
+    while pending:
+        done, _ = wait(pending, return_when=FIRST_COMPLETED)
+
+        for future in done:
+            pending.pop(future)
+            yield future.result()
+            submit_next()
+
+
+def process_attachments(
+    conn, cur, s3, channel_id, attachments, report, discord_client=None,
+    message_filter=None, progress=None, refresh_progress=None, report_path=None,
+):
     """Download, store and link the attachments of one message file.
 
     ``attachment`` entries are ``(message_id, position, att)`` where ``att`` is
@@ -2505,26 +2846,33 @@ def process_attachments(cur, s3, channel_id, attachments, report, discord_client
     (no re-encode, no size cap) as ``files/<sha256>``. Expired signed URLs are
     refreshed in batch first.
 
-    Links are written straight into ``app.message_attachments`` in the caller's
-    transaction, next to the ``app.files`` row, so a crash can no longer commit
-    a file row without its link. An attachment whose file row already exists is
-    reused without a download and its missing link is re-created, so re-running
-    with ``--refresh-messages`` repairs earlier orphans. Messages already linked
-    at a given position are skipped. ``message_filter`` (a set) limits the work
-    to those message ids; ``None`` means all. Fails soft per attachment.
+    Downloads run in a bounded window (:func:`iter_downloads`) so memory stays
+    proportional to :data:`ATTACHMENT_WINDOW`, not to the channel. Links are
+    written straight into ``app.message_attachments`` in the same transaction
+    as the ``app.files`` row and checkpointed every
+    :data:`ATTACHMENT_COMMIT_BATCH` attachments (and on
+    ``ATTACHMENT_COMMIT_INTERVAL_S``), so an interrupted run resumes inside a
+    large channel instead of re-downloading it. An attachment whose file row
+    already exists is reused without a download and its missing link is
+    re-created. Messages already linked at a given position are skipped.
+    ``message_filter`` (a set) limits the work to those message ids; ``None``
+    means all. Fails soft per attachment.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     if not attachments:
-        return []
+        return
+
+    all_attachments = attachments
+    old_attachments = []
 
     if message_filter is not None:
-        attachments = [entry for entry in attachments if entry[0] in message_filter]
+        old_attachments = [
+            entry for entry in all_attachments if entry[0] not in message_filter
+        ]
+        attachments = [entry for entry in all_attachments if entry[0] in message_filter]
 
-        if not attachments:
-            return []
-
-    message_ids = {message_id for message_id, _, _ in attachments}
+    message_ids = {message_id for message_id, _, _ in all_attachments}
     existing_positions = set()
 
     if message_ids:
@@ -2535,8 +2883,29 @@ def process_attachments(cur, s3, channel_id, attachments, report, discord_client
         )
         existing_positions = {(int(mid), int(pos)) for mid, pos in cur.fetchall()}
 
-    links = []
-    references = []
+    if old_attachments:
+        # Incremental import: do not re-check attachments of messages that were
+        # imported by an earlier run. Count the ones that never got a link so
+        # the report shows what `--refresh-messages` would backfill.
+        missing_old = sum(
+            1
+            for message_id, position, att in old_attachments
+            if att.get("id") is not None
+            and (message_id, position) not in existing_positions
+            and is_discord_host(att.get("url"))
+        )
+
+        if missing_old:
+            report["attachments_skipped_incremental"] += missing_old
+            report["warnings"].append(
+                f"channel {channel_id}: incremental import left {missing_old} "
+                "previously unimported attachments untouched "
+                "(use --refresh-messages to backfill them)"
+            )
+
+    if not attachments:
+        return
+
     unresolved = []
     seen_positions = set()
 
@@ -2557,82 +2926,168 @@ def process_attachments(cur, s3, channel_id, attachments, report, discord_client
 
         seen_positions.add((message_id, position))
 
-        url = att.get("url")
-
-        if not is_discord_host(url):
+        if not is_discord_host(att.get("url")):
             report["attachments_skipped_host"] += 1
 
             continue
 
         unresolved.append((message_id, position, att_id, att))
 
-    if unresolved:
-        still = set(
-            id(entry)
-            for entry in refresh_expired_urls(
-                discord_client, channel_id, unresolved, report
-            )
+    if not unresolved:
+        return
+
+    still = set(
+        id(entry)
+        for entry in refresh_expired_urls(
+            discord_client, channel_id, unresolved, report, progress=refresh_progress
         )
-        unresolved = [entry for entry in unresolved if id(entry) not in still]
+    )
+    unresolved = [entry for entry in unresolved if id(entry) not in still]
 
-        # One download per distinct Discord attachment id.
-        unique = {}
+    if not unresolved:
+        return
 
-        for entry in unresolved:
-            unique.setdefault(entry[2], entry)
+    # One download per distinct Discord attachment id; every position that uses
+    # it links to the same stored file.
+    entries_by_att = {}
 
-        def fetch_one(entry):
-            try:
-                data = download_bytes(entry[3]["url"])
-            except Exception as e:  # noqa: BLE001 - a bad attachment must not abort
-                return entry, None, str(e)
+    for entry in unresolved:
+        entries_by_att.setdefault(entry[2], []).append(entry)
 
-            return entry, data, None
+    cur.execute(
+        "SELECT id, content_type FROM app.files WHERE id = ANY(%s::bigint[])",
+        (sorted(entries_by_att),),
+    )
+    reused = {int(row[0]): row[1] for row in cur.fetchall()}
 
-        resolved = {}
+    pending_links = []
+    pending_refs = []
+    last_flush = time.monotonic()
 
-        if unique:
-            with ThreadPoolExecutor(max_workers=ATTACHMENT_CONCURRENCY) as pool:
-                for entry, data, error in pool.map(fetch_one, unique.values()):
-                    if data is None:
-                        report["attachments_skipped_download"] += 1
+    def flush_links(force=False):
+        nonlocal last_flush
 
-                        continue
+        if not pending_links:
+            return
 
-                    stored = store_attachment(cur, s3, entry[2], data, entry[3], report)
+        if (
+            not force
+            and len(pending_links) < ATTACHMENT_COMMIT_BATCH
+            and time.monotonic() - last_flush < ATTACHMENT_COMMIT_INTERVAL_S
+        ):
+            return
 
-                    if stored is None:
-                        report["attachments_skipped_download"] += 1
+        linked_pairs = link_attachments(cur, pending_links, report)
+        append_attachment_tokens(
+            cur, [ref for ref in pending_refs if (ref[0], ref[1]) in linked_pairs]
+        )
+        pending_links.clear()
+        pending_refs.clear()
+        last_flush = time.monotonic()
 
-                        continue
+        if conn is not None:
+            conn.commit()
 
-                    resolved[entry[2]] = stored
+        if report_path is not None:
+            write_report(report_path, report, quiet=True)
 
-        for message_id, position, att_id, att in unresolved:
-            stored = resolved.get(att_id)
+    def add_links(att_id, stored):
+        for message_id, position, _att_id, att in entries_by_att.get(att_id, ()):
+            pending_links.append((message_id, stored[0], position))
+            pending_refs.append(
+                (message_id, stored[0], att.get("filename"), stored[1])
+            )
 
-            if stored is not None:
-                file_id, content_type = stored
-                links.append((message_id, file_id, position))
-                references.append(
-                    (message_id, file_id, att.get("filename"), content_type)
-                )
+        flush_links()
 
-    if links:
-        linked_pairs = link_attachments(cur, links, report)
-        references = [ref for ref in references if (ref[0], ref[1]) in linked_pairs]
-        append_attachment_tokens(cur, references)
+    resolved = {}
 
-    return references
+    for att_id, content_type in reused.items():
+        resolved[att_id] = (att_id, content_type)
+        report["attachments_reused"] += 1
+        add_links(att_id, resolved[att_id])
+
+    flush_links(force=True)
+
+    to_download = [
+        entries_by_att[att_id][0]
+        for att_id in entries_by_att
+        if att_id not in reused
+    ]
+    total = len(to_download)
+    total_bytes = sum(attachment_size(entry[3]) for entry in to_download)
+    done = 0
+    done_bytes = 0
+
+    if progress is not None:
+        progress(0, total, 0, total_bytes)
+
+    def fetch_one(entry):
+        try:
+            data = download_bytes(entry[3]["url"])
+        except Exception as e:  # noqa: BLE001 - a bad attachment must not abort
+            return entry, None, f"{type(e).__name__}: {e}"
+
+        return entry, data, None
+
+    with ThreadPoolExecutor(max_workers=ATTACHMENT_CONCURRENCY) as pool:
+        for entry, data, error in iter_downloads(
+            pool, fetch_one, to_download, ATTACHMENT_WINDOW
+        ):
+            att_id = entry[2]
+            done += 1
+
+            if data is None:
+                report["attachments_skipped_download"] += 1
+                errors = report["attachment_download_errors"]
+
+                if error in errors or len(errors) < 50:
+                    errors[error] = errors.get(error, 0) + 1
+            else:
+                done_bytes += len(data)
+                stored = store_attachment(cur, s3, att_id, data, entry[3], report)
+
+                if stored is None:
+                    report["attachments_skipped_download"] += 1
+                else:
+                    resolved[att_id] = stored
+                    add_links(att_id, stored)
+
+            if progress is not None:
+                progress(done, total, done_bytes, total_bytes)
+
+    flush_links(force=True)
 
 
 
-def write_report(report_path, report):
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+def write_report(report_path, report, quiet=False):
+    """Atomically persist the report.
 
-    print(f"Report written to {report_path}")
+    The report carries generated webhook tokens, which exist only in plaintext
+    here. Writing it after every checkpoint (instead of once at the end) keeps
+    them recoverable when a long import is interrupted.
+    """
+    temp_path = f"{report_path}.tmp"
+
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        os.replace(temp_path, report_path)
+    except OSError as e:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+        if quiet:
+            return
+
+        raise
+
+    if not quiet:
+        print(f"Report written to {report_path}")
 
 
 def _supports_extract_filter():
@@ -2757,10 +3212,11 @@ def main():
     parser.add_argument(
         "--refresh-messages",
         action="store_true",
-        help="re-process messages that already exist: refresh their attachment URLs "
-        "and re-check for new/late attachments, and re-create any missing "
-        "message_attachments link for an already-stored file (existing files and "
-        "hashes are never re-downloaded or re-uploaded)",
+        help="re-process messages that already exist: refresh their attachment URLs, "
+        "backfill attachments skipped by an earlier run, re-check for new/late "
+        "attachments, and re-create any missing message_attachments link for an "
+        "already-stored file (existing files and hashes are never re-downloaded or "
+        "re-uploaded)",
     )
     parser.add_argument(
         "--skip-avatars",
@@ -2838,7 +3294,63 @@ def main():
             temp_dir.cleanup()
 
 
+def load_previous_report(report_path):
+    """Load the previous run's report, or an empty object when there is none."""
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            previous = json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+    return previous if isinstance(previous, dict) else {}
+
+
+def previous_webhook_tokens(previous):
+    """Recover generated webhook tokens from an earlier run's report.
+
+    A re-run finds the webhook rows already present and therefore never
+    regenerates their tokens; without this merge, the checkpoint written by the
+    new run would erase the only copy of those plaintext tokens.
+    """
+    tokens = previous.get("webhook_tokens")
+    tokens = tokens if isinstance(tokens, dict) else {}
+
+    return {str(key): value for key, value in tokens.items() if isinstance(value, str)}
+
+
+def previous_completed_channels(previous):
+    """Return validated per-channel completion markers from a previous run."""
+    completed = previous.get("completed_channels")
+    completed = completed if isinstance(completed, dict) else {}
+    result = {}
+
+    for key, marker in completed.items():
+        if not isinstance(marker, dict):
+            continue
+
+        size = marker.get("size")
+        mtime = marker.get("mtime")
+
+        if not isinstance(size, int) or isinstance(size, bool):
+            continue
+
+        if not isinstance(mtime, int) or isinstance(mtime, bool):
+            continue
+
+        skipped = marker.get("attachments_skipped")
+        skipped = skipped if isinstance(skipped, int) and not isinstance(skipped, bool) else 0
+        result[str(key)] = {
+            "size": size,
+            "mtime": mtime,
+            "attachments": bool(marker.get("attachments")),
+            "attachments_skipped": skipped,
+        }
+
+    return result
+
+
 def run_import(guild_dir, report_path, args):
+    previous = load_previous_report(report_path)
     report = {
         "guild_dir": guild_dir,
         "roles_inserted": 0,
@@ -2877,7 +3389,8 @@ def run_import(guild_dir, report_path, args):
         "webhook_placeholders_created": 0,
         "webhook_avatars_set": 0,
         "webhook_avatars_skipped": 0,
-        "webhook_tokens": {},
+        "webhook_tokens": previous_webhook_tokens(previous),
+        "webhook_tokens_unknown": [],
         "reactions_inserted": 0,
         "reactions_skipped_empty": 0,
         "reactions_skipped_foreign": 0,
@@ -2885,13 +3398,19 @@ def run_import(guild_dir, report_path, args):
         "reactions_skipped_no_emoji": 0,
         "attachments_uploaded": 0,
         "attachments_linked": 0,
+        "attachments_reused": 0,
+        "attachments_skipped_incremental": 0,
         "attachments_skipped_existing": 0,
         "attachments_skipped_host": 0,
         "attachments_skipped_download": 0,
         "attachments_skipped_expired": 0,
+        "attachment_download_errors": {},
         "attachments_refreshed": 0,
         "attachment_bytes_uploaded": 0,
         "s3_puts": 0,
+        "message_files_done": 0,
+        "last_imported_channel": None,
+        "completed_channels": previous_completed_channels(previous),
         "channels_skipped": {},
         "malformed_lines": [],
         "warnings": [],
@@ -3019,6 +3538,7 @@ def run_import(guild_dir, report_path, args):
     emoji_canonical = load_emoji_canonical()
     emoji_state = {}
     known_webhook_ids = set()
+    progress = ImportProgress(len(message_files))
 
     with psycopg.connect(conninfo) as conn:
         with conn.cursor() as cur:
@@ -3086,6 +3606,9 @@ def run_import(guild_dir, report_path, args):
                 assign_superuser(cur, guild_id, int(args.admin_user_id), report)
 
             conn.commit()
+            # Generated webhook tokens exist only in plaintext in the report;
+            # persist them before the long message phase starts.
+            write_report(report_path, report, quiet=True)
 
         with conn.cursor() as cur:
             if not args.skip_avatars:
@@ -3109,12 +3632,63 @@ def run_import(guild_dir, report_path, args):
         guild_emoji_ids = frozenset(emoji_dump)
 
         conn.commit()
+        write_report(report_path, report, quiet=True)
 
         ensure_message_schema(conn)
 
         deleted_ids = set()
 
         for index, (channel_id, path) in enumerate(message_files, 1):
+            channel = imported_channels.get(channel_id) or {}
+            channel_name = channel.get("name") or f"channel-{channel_id}"
+            stat = os.stat(path)
+            file_state = {"size": stat.st_size, "mtime": int(stat.st_mtime)}
+            channel_attachments = want_attachments and channel_selected(
+                channel_id,
+                args.attachments_whitelist,
+                args.attachments_blacklist,
+            )
+            progress.begin_channel(index, channel_id, channel_name, stat.st_size)
+
+            marker = report["completed_channels"].get(str(channel_id))
+
+            # A completed, unchanged channel is skipped on resume. Stats are
+            # recorded after the attachment phase, so a channel interrupted in
+            # the middle is always retried. `--limit` and `--refresh-messages`
+            # force the normal replay.
+            if (
+                args.limit is None
+                and not args.refresh_messages
+                and marker is not None
+                and marker["size"] == file_state["size"]
+                and marker["mtime"] == file_state["mtime"]
+                and (not channel_attachments or marker["attachments"])
+            ):
+                report["message_files_done"] = index
+                report["last_imported_channel"] = str(channel_id)
+
+                if marker.get("attachments_skipped"):
+                    report["warnings"].append(
+                        f"channel {channel_id}: {marker['attachments_skipped']} "
+                        "attachments were not imported by an earlier run "
+                        "(use --refresh-messages to backfill them)"
+                    )
+
+                progress.skipped()
+                write_report(report_path, report, quiet=True)
+                continue
+
+            # A channel completed by an earlier run is processed
+            # incrementally: only attachments of messages inserted now are
+            # considered. Retrying attachments that an earlier run skipped
+            # (expired URL, no token) is what `--refresh-messages` is for.
+            incremental = (
+                not args.refresh_messages
+                and channel_attachments
+                and marker is not None
+                and marker["attachments"]
+            )
+
             try:
                 pending_webhooks = {}
 
@@ -3134,16 +3708,14 @@ def run_import(guild_dir, report_path, args):
                         deleted_ids,
                         max_embeds,
                         report,
-                        want_attachments=want_attachments
-                        and channel_selected(
-                            channel_id,
-                            args.attachments_whitelist,
-                            args.attachments_blacklist,
-                        ),
+                        want_attachments=channel_attachments,
                         guild_emoji_ids=guild_emoji_ids,
                         emoji_canonical=emoji_canonical,
+                        progress=progress.messages,
                     )
-                    inserted_ids = flush_messages(cur, report)
+                    inserted_ids = flush_messages(
+                        cur, report, return_ids=incremental
+                    )
 
                     import_emojis(
                         cur, guild_id, emoji_dump, emoji_limits,
@@ -3152,27 +3724,59 @@ def run_import(guild_dir, report_path, args):
                     )
                     flush_reactions(cur, report)
 
-                    if attachments:
-                        process_attachments(
-                            cur, s3, channel_id, attachments, report,
-                            discord_client=discord_client,
-                            message_filter=None if args.refresh_messages else inserted_ids,
-                        )
-
                     if args.refresh_messages:
                         backfill_attachment_tokens(cur)
 
                     clear_import_staging(cur)
 
+                # Messages are durable before the potentially long attachment
+                # phase: an interrupted run resumes inside the channel instead
+                # of replaying (and re-downloading) it from the start.
                 conn.commit()
-                print(f"[{index}/{len(message_files)}] {os.path.basename(path)}: {written}")
+                progress.finish_messages(written)
+                report["message_files_done"] = index
+                report["last_imported_channel"] = str(channel_id)
+                write_report(report_path, report, quiet=True)
+
+                skipped_before = (
+                    report["attachments_skipped_download"]
+                    + report["attachments_skipped_expired"]
+                )
+
+                if attachments:
+                    with conn.cursor() as cur:
+                        process_attachments(
+                            conn, cur, s3, channel_id, attachments, report,
+                            discord_client=discord_client,
+                            message_filter=inserted_ids if incremental else None,
+                            progress=progress.attachments,
+                            refresh_progress=progress.refresh,
+                            report_path=report_path,
+                        )
+
+                channel_skipped = (
+                    report["attachments_skipped_download"]
+                    + report["attachments_skipped_expired"]
+                    - skipped_before
+                )
+
+                report["completed_channels"][str(channel_id)] = {
+                    "size": file_state["size"],
+                    "mtime": file_state["mtime"],
+                    "attachments": channel_attachments,
+                    "attachments_skipped": channel_skipped,
+                }
+                processed_attachments = (
+                    sum(1 for entry in attachments if entry[0] in inserted_ids)
+                    if incremental
+                    else len(attachments)
+                )
+                progress.complete(processed_attachments)
+                write_report(report_path, report, quiet=True)
             except Exception as e:  # noqa: BLE001 - keep going on a bad file
                 conn.rollback()
                 report["warnings"].append(f"failed to import {path}: {e}")
-                print(
-                    f"[{index}/{len(message_files)}] {os.path.basename(path)}: FAILED: {e}",
-                    file=sys.stderr,
-                )
+                progress.failed(e)
 
         with conn.cursor() as cur:
             refresh_users(
@@ -3182,6 +3786,40 @@ def run_import(guild_dir, report_path, args):
             anonymize_deleted_users(cur, deleted_ids, inserted_user_ids, report)
 
         conn.commit()
+
+    skipped_attachments = (
+        report["attachments_skipped_download"]
+        + report["attachments_skipped_expired"]
+    )
+
+    if skipped_attachments:
+        report["warnings"].append(
+            f"{skipped_attachments} attachments were not imported "
+            "(download failed or the signed URL could not be refreshed); "
+            "rerun with --refresh-messages to retry them"
+        )
+        print(
+            f"warning: {skipped_attachments} attachments were not imported; "
+            "rerun with --refresh-messages to retry them",
+            file=sys.stderr,
+        )
+
+    if report["webhook_tokens_unknown"]:
+        unknown = sorted(report["webhook_tokens_unknown"], key=int)
+        report["warnings"].append(
+            "webhook tokens for "
+            + ", ".join(unknown)
+            + " were generated by an earlier interrupted run and never persisted; "
+            "their plaintext is unrecoverable. Recreate those webhooks (or update "
+            "their token_hash) to get a usable token"
+        )
+        print(
+            "warning: generated webhook tokens for "
+            + ", ".join(unknown[:10])
+            + (" ..." if len(unknown) > 10 else "")
+            + " were lost in an earlier interrupted run; recreate those webhooks",
+            file=sys.stderr,
+        )
 
     if discord_client is not None:
         discord_client.close()
@@ -3204,8 +3842,11 @@ def run_import(guild_dir, report_path, args):
         f"webhooks={report['webhooks_imported']}"
         f"+{report['webhook_placeholders_created']}p "
         f"reactions={report['reactions_inserted']} "
-        f"attachments={report['attachments_uploaded']}/"
+        f"attachments={report['attachments_uploaded']}"
+        f"+{report['attachments_reused']}reused/"
         f"{report['attachment_bytes_uploaded']}B "
+        f"attachments_skipped={report['attachments_skipped_download']}"
+        f"+{report['attachments_skipped_expired']}expired "
         f"links={report['message_links_rewritten']} "
         f"mentions_normalized={report['legacy_mentions_normalized']} "
         f"gif_embeds={report['gif_embeds_replaced']} "
