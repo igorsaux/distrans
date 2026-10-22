@@ -7,9 +7,34 @@
 # The backend does not rate-limit and does not parse X-Forwarded-For, so this
 # edge is the only limiter. Keep these rates and the per-location bursts in
 # sync with the app's own limits (GET /api/limits).
+#
+# `rate` is the sustained leaky-bucket drain rate, `burst` is what may be
+# accepted on top of it *at once*. They are not interchangeable: a page load
+# fires a whole batch of requests within milliseconds, and anything above
+# `burst` in that instant is rejected with 429 regardless of how low the
+# average rate is. Size every burst for one full page load, not one click.
+
+# Empty key = not accounted, so `writes` only limits mutating requests while
+# the same location still serves reads from `general`.
+map $request_method $write_client {
+    default $binary_remote_addr;
+    GET     "";
+    HEAD    "";
+}
+
+# Same trick for the image endpoints: only reads use the generous `media`
+# bucket, while PUT/DELETE on the very same path fall through to `writes`.
+map $request_method $media_client {
+    default "";
+    GET     $binary_remote_addr;
+    HEAD    $binary_remote_addr;
+}
+
 limit_req_zone $binary_remote_addr zone=general:8m    rate=120r/s;
+limit_req_zone $media_client        zone=media:16m    rate=600r/s;
 limit_req_zone $binary_remote_addr zone=creating:8m   rate=5r/s;
 limit_req_zone $binary_remote_addr zone=restricted:8m rate=5r/s;
+limit_req_zone $write_client        zone=writes:8m    rate=5r/s;
 limit_req_zone $binary_remote_addr zone=search:8m     rate=2r/s;
 limit_req_status 429;
 limit_req_log_level warn;
@@ -18,7 +43,7 @@ limit_req_log_level warn;
 # also holds WebSockets — and raise it if users share a NAT/CGNAT address.
 limit_conn_zone $binary_remote_addr zone=perip:8m;
 limit_conn_zone $server_name zone=perserver:8m;
-limit_conn perip 50;
+limit_conn perip 200;
 limit_conn perserver 20000;
 limit_conn_status 429;
 limit_conn_log_level warn;
@@ -53,6 +78,20 @@ map $http_upgrade $connection_upgrade {
     default upgrade;
     ''      close;
 }
+
+# Edge cache for hash-addressed images (emoji icons and avatars). Their URL
+# carries the content hash, so a hit can never be stale: a changed image gets a
+# new URL. The backend marks them `private, immutable`, which only means "do
+# not put this in a shared cache"; the media locations below override that for
+# this cache on purpose, otherwise every page load turns into one Postgres read
+# per image.
+#
+# This is a plain directory on the host's filesystem, nginx
+# creates it on start and must be able to write there, e.g. as the nginx user:
+#   install -d -o nginx -g nginx /var/cache/nginx/distrans-media
+# Give it enough disk for the icons/avatars served within `inactive`.
+proxy_cache_path /var/cache/nginx/distrans-media levels=1:2 keys_zone=media_cache:16m
+                 max_size=2g inactive=30d use_temp_path=off;
 
 server {
     listen 443 ssl;
@@ -105,15 +144,76 @@ server {
 
     # App shell (and root files): always revalidate.
     location / {
-        limit_req zone=general burst=20 nodelay;
+        limit_req zone=general burst=50 nodelay;
 
         try_files $uri $uri/ /index.html;
 
         expires -1;
     }
 
+    # Hash-addressed images: GET /api/emojis/{id}/icon?hash=… and
+    # GET /api/{users|guilds|webhooks}/{id}/avatar?hash=… . Public, cheap and
+    # immutable, but a page load can request hundreds of them at once (every
+    # custom emoji in every visible guild). They therefore get their own zone
+    # and a burst large enough for a full load, so they neither 429 nor drain
+    # the `general` bucket shared with /api/gateway and regular API calls.
+    #
+    # PUT on these same paths re-encodes an image and is expensive, so it is
+    # handled by `writes` (empty `media` key) instead of the media burst.
+    #
+    # `proxy_ignore_headers Cache-Control` overrides the backend's `private`
+    # marker so the edge cache can absorb the burst; that is safe here because
+    # the hash in the URL changes whenever the image changes.
+    location ~ ^/api/emojis/[0-9]+/icon$ {
+        limit_req zone=media burst=400 nodelay;
+        limit_req zone=writes burst=5 nodelay;
+
+        proxy_cache media_cache;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        proxy_cache_valid 200 365d;
+        proxy_cache_lock on;
+        proxy_cache_lock_age 10s;
+        proxy_cache_use_stale updating error timeout;
+        proxy_ignore_headers Cache-Control;
+
+        proxy_pass http://distrans;
+        proxy_http_version 1.1;
+
+        proxy_set_header Connection        "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        access_log off;
+    }
+
+    location ~ ^/api/(users|guilds|webhooks)/[0-9]+/avatar$ {
+        limit_req zone=media burst=200 nodelay;
+        limit_req zone=writes burst=5 nodelay;
+
+        proxy_cache media_cache;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        proxy_cache_valid 200 365d;
+        proxy_cache_lock on;
+        proxy_cache_lock_age 10s;
+        proxy_cache_use_stale updating error timeout;
+        proxy_ignore_headers Cache-Control;
+
+        proxy_pass http://distrans;
+        proxy_http_version 1.1;
+
+        proxy_set_header Connection        "";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        access_log off;
+    }
+
     location /api {
-        limit_req zone=general burst=10 nodelay;
+        limit_req zone=general burst=60 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -127,7 +227,7 @@ server {
 
     # File upload: expensive (decode + re-encode + S3 PUT).
     location = /api/files {
-        limit_req zone=restricted burst=1 nodelay;
+        limit_req zone=restricted burst=3 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -139,9 +239,12 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # Message creation in a channel.
+    # Channel messages: GET lists history, POST creates one. Reads are cheap and
+    # happen on every channel switch, so they stay on `general`; the write
+    # limiter applies to mutating methods only through the `writes` zone.
     location ~ ^/api/channels/[0-9]+/messages$ {
-        limit_req zone=restricted burst=2 nodelay;
+        limit_req zone=general burst=40 nodelay;
+        limit_req zone=writes burst=5 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -153,9 +256,11 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # Message edit/delete (mass content removal).
+    # Single message: GET reads it, PATCH/DELETE edit or remove it (mass content
+    # removal is the expensive/abusable part, hence the write limiter).
     location ~ ^/api/messages/[0-9]+$ {
-        limit_req zone=restricted burst=2 nodelay;
+        limit_req zone=general burst=20 nodelay;
+        limit_req zone=writes burst=5 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -169,7 +274,7 @@ server {
 
     # Auth and system endpoints.
     location /api/auth {
-        limit_req zone=creating burst=1 nodelay;
+        limit_req zone=creating burst=5 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -182,7 +287,7 @@ server {
     }
 
     location /api/system {
-        limit_req zone=creating burst=1 nodelay;
+        limit_req zone=creating burst=5 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -196,7 +301,7 @@ server {
 
     # Clients fetch file origins and limits here.
     location /api/limits {
-        limit_req zone=general burst=20 nodelay;
+        limit_req zone=general burst=40 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -210,7 +315,7 @@ server {
 
     # Full-text message search: heavy Postgres (trigram) query.
     location ~ ^/api/guilds/[0-9]+/messages/search$ {
-        limit_req zone=search burst=2 nodelay;
+        limit_req zone=search burst=5 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -224,9 +329,10 @@ server {
 
     # Webhook execute: token-authenticated, no session, creates a message.
     # The negative lookahead keeps the reserved /avatar subpath (webhook
-    # management) out of this zone.
+    # management) out of this zone. CI/integration senders legitimately fire
+    # several events in one go, so the burst is wider than for a human action.
     location ~ ^/api/webhooks/[0-9]+/(?!avatar$)[^/]+(/github)?$ {
-        limit_req zone=restricted burst=2 nodelay;
+        limit_req zone=restricted burst=20 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -238,11 +344,12 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # Delta sync (changed-since). Polled on reconnect/focus only, so a low rate
-    # is plenty. The `$` anchors keep these from colliding with the existing
-    # message endpoints above.
+    # Delta sync (changed-since). Polled on reconnect/focus only, so the rate
+    # stays low, but one reconnect fires all of them and every open tab repeats
+    # it, hence the wider burst. The `$` anchors keep these from colliding with
+    # the existing message endpoints above.
     location ~ ^/api/guilds/[0-9]+/sync$ {
-        limit_req zone=restricted burst=2 nodelay;
+        limit_req zone=restricted burst=10 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -255,7 +362,7 @@ server {
     }
 
     location ~ ^/api/channels/[0-9]+/messages/sync$ {
-        limit_req zone=restricted burst=2 nodelay;
+        limit_req zone=restricted burst=10 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -268,7 +375,7 @@ server {
     }
 
     location = /api/users/sync {
-        limit_req zone=restricted burst=2 nodelay;
+        limit_req zone=restricted burst=10 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
@@ -280,9 +387,11 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # WebSocket gateway. Connection here comes from the map, not "".
+    # WebSocket gateway. Connection here comes from the map, not "". The burst
+    # covers reconnect storms (many tabs, network flaps) without touching the
+    # long-lived connection itself.
     location /api/gateway {
-        limit_req zone=general burst=10 nodelay;
+        limit_req zone=general burst=20 nodelay;
 
         proxy_pass http://distrans;
         proxy_http_version 1.1;
