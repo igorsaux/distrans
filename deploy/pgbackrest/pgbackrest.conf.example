@@ -1,0 +1,74 @@
+# pgBackRest template for Distrans.
+#
+# Copy this file to /etc/pgbackrest/pgbackrest.conf, fill in every CHANGEME
+# value, then:
+#
+#   chown postgres:postgres /etc/pgbackrest/pgbackrest.conf
+#   chmod 600 /etc/pgbackrest/pgbackrest.conf
+#
+# Paths below assume Debian/Ubuntu PostgreSQL 17:
+#   PGDATA = /var/lib/postgresql/17/main
+#   socket = /var/run/postgresql
+# Adjust pg1-* if PostgreSQL runs in Docker or another layout.
+
+[global]
+# ---------------------------------------------------------------------------
+# S3 repository
+# ---------------------------------------------------------------------------
+repo1-type=s3
+repo1-s3-bucket=CHANGEME-distrans-backups
+repo1-s3-endpoint=CHANGEME
+repo1-s3-region=CHANGEME
+repo1-s3-uri-style=host
+repo1-s3-key=CHANGEME_ACCESS_KEY
+repo1-s3-key-secret=CHANGEME_SECRET_KEY
+repo1-path=/distrans
+
+# Encrypt the repository at rest. Store this passphrase outside the repo and
+# outside git: without it the backups cannot be restored.
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=CHANGEME_LONG_RANDOM_PASSPHRASE
+
+# Keep 2 full backups (and the WAL needed to restore them), plus 7 diffs.
+repo1-retention-full=2
+repo1-retention-full-type=count
+repo1-retention-diff=7
+repo1-retention-archive-type=full
+repo1-retention-archive=2
+
+# ---------------------------------------------------------------------------
+# Backup behaviour
+# ---------------------------------------------------------------------------
+compress-type=zst
+compress-level=3
+process-max=2
+# Force a checkpoint at backup start instead of waiting for the next one.
+start-fast=y
+
+# ---------------------------------------------------------------------------
+# WAL archiving
+# ---------------------------------------------------------------------------
+# archive-async keeps PostgreSQL from blocking while a segment is uploaded.
+# archive-push-queue-max bounds the local spool: if S3 is unreachable and the
+# queue is exceeded, pgBackRest fails the archive push instead of silently
+# filling the disk. PostgreSQL will then retain WAL in pg_wal, so monitor it.
+archive-async=y
+spool-path=/var/lib/pgbackrest/spool
+archive-push-queue-max=2gb
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log-path=/var/log/pgbackrest
+log-level-console=info
+log-level-file=detail
+
+# ---------------------------------------------------------------------------
+# Stanza
+# ---------------------------------------------------------------------------
+[distrans]
+pg1-path=/var/lib/postgresql/17/main
+pg1-port=5432
+pg1-user=postgres
+pg1-database=postgres
+pg1-socket-path=/var/run/postgresql

@@ -1,0 +1,9 @@
+# /etc/cron.d/pgbackrest
+# Full backup on Sunday, incremental on other days.
+# `backup` also applies repo1-retention-* and expires old WAL.
+
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 3 * * 0 postgres pgbackrest --stanza=distrans backup --type=full
+30 3 * * 1-6 postgres pgbackrest --stanza=distrans backup --type=incr
