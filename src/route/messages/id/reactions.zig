@@ -344,7 +344,7 @@ pub inline fn usersGetHandle(
 /// R1 - content type must be application/json (415) and body non-empty (400) (see putHandle)
 /// R2 - user must be logged (bearer); deleted users are rejected
 /// R3 - the message must exist (404 "Message not found")
-/// R4 - user must have add_reactions on the message's channel
+/// R4 - user must have read_messages and add_reactions on the message's channel
 /// R5 - the body must be valid JSON and an object ("Bad JSON" / "Expected an object")
 /// R6 - exactly one of "emoji_id" / "unicode_emoji" must be present and a string
 ///      (400 "Specify exactly one of 'emoji_id' or 'unicode_emoji'" /
@@ -433,7 +433,7 @@ const PutTask = struct {
                     .guild_id = this.message_is_exists_task.?.result.?.guild_id,
                     .channel_id = this.message_is_exists_task.?.result.?.channel_id,
                     .user_id = this.bearer_middleware_task.?.result.?,
-                    .required = .{ .add_reactions = true },
+                    .required = .{ .read_messages = true, .add_reactions = true },
                 }));
             }
 
@@ -702,11 +702,11 @@ pub inline fn putHandle(
 ///      rejected
 ///      (400 "Unknown parameter") and both emoji params together are rejected
 ///      (400 "Specify exactly one of 'emoji_id' or 'unicode_emoji'").
-/// R4 - an optional "user_id" target must parse (400 "Bad 'user_id'
-///      parameter"); removing someone else's reaction additionally requires
-///      delete_reactions on the channel (403 "Missing permissions") and being
-///      strictly higher than the target (403). Removing the caller's own
-///      reaction needs no permission.
+/// R4 - user must have read_messages on the message's channel (403 "Missing
+///      permissions"). An optional "user_id" target must parse (400 "Bad
+///      'user_id' parameter"); removing someone else's reaction additionally
+///      requires delete_reactions on the channel and being strictly higher than
+///      the target (403 "Missing permissions").
 /// R5 - the reaction(s) are removed (idempotent) and the request succeeds with
 ///      204 No Content; each removed reaction dispatches a reaction_removed
 ///      gateway event
@@ -800,29 +800,34 @@ const DeleteTask = struct {
         const target_user_id = this.payload.target_user_id orelse caller_id;
 
         // R4
+        var required: root.types.Permissions = .{ .read_messages = true };
         if (target_user_id != caller_id) {
-            // R4
-            // await this.check_user_channel_rights_task
-            {
-                if (this.check_user_channel_rights_task == null) {
-                    this.check_user_channel_rights_task = .from(.init(this.db.?, .{
-                        .guild_id = this.message_is_exists_task.?.result.?.guild_id,
-                        .channel_id = this.message_is_exists_task.?.result.?.channel_id,
-                        .user_id = caller_id,
-                        .required = .{ .delete_reactions = true },
-                    }));
-                }
+            required.delete_reactions = true;
+        }
 
-                while (this.check_user_channel_rights_task.?.await()) |res| {
-                    return res.discard();
-                }
-
-                if (!this.check_user_channel_rights_task.?.result) {
-                    return root.route.generic.responseErrorMessage(this.response, .forbidden, "Missing permissions");
-                }
+        // R4
+        // await this.check_user_channel_rights_task
+        {
+            if (this.check_user_channel_rights_task == null) {
+                this.check_user_channel_rights_task = .from(.init(this.db.?, .{
+                    .guild_id = this.message_is_exists_task.?.result.?.guild_id,
+                    .channel_id = this.message_is_exists_task.?.result.?.channel_id,
+                    .user_id = caller_id,
+                    .required = required,
+                }));
             }
 
-            // R4
+            while (this.check_user_channel_rights_task.?.await()) |res| {
+                return res.discard();
+            }
+
+            if (!this.check_user_channel_rights_task.?.result) {
+                return root.route.generic.responseErrorMessage(this.response, .forbidden, "Missing permissions");
+            }
+        }
+
+        // R4
+        if (target_user_id != caller_id) {
             // await this.is_higher_than_other_task
             {
                 if (this.is_higher_than_other_task == null) {

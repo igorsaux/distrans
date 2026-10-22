@@ -8,14 +8,16 @@
 #             R4 custom emoji belongs to the message's guild; R5 query params
 #             (emoji_id XOR unicode_emoji, keyset-paginated ids)
 # PUT       - R1 JSON content type + non-empty body; R2 logged in; R3 message
-#             exists; R4 add_reactions; R5 body object; R6 exactly one of
-#             emoji_id/unicode_emoji; R7 custom emoji exists in the message's
-#             guild; R8 unicode is one emoji sequence in any qualification form
-#             (stored canonicalized) or a regional indicator symbol; R9 distinct
-#             cap (api.messages.max_reactions); R10 idempotent add
+#             exists; R4 read_messages and add_reactions; R5 body object;
+#             R6 exactly one of emoji_id/unicode_emoji; R7 custom emoji exists
+#             in the message's guild; R8 unicode is one emoji sequence in any
+#             qualification form (stored canonicalized) or a regional indicator
+#             symbol; R9 distinct cap (api.messages.max_reactions); R10
+#             idempotent add
 # DELETE    - R1 logged in; R2 message exists; R3 emoji params
-#             (emoji_id XOR unicode_emoji, none = remove all own); R4 optional
-#             user_id target needs delete_reactions and a strictly higher role;
+#             (emoji_id XOR unicode_emoji, none = remove all own); R4
+#             read_messages is always required, and an optional user_id target
+#             additionally needs delete_reactions and a strictly higher role;
 #             R5 idempotent remove
 
 import json
@@ -611,6 +613,18 @@ def test_put_reaction_forbidden_without_add_reactions(
     assert response.json()["message"] == "Missing permissions"
 
 
+# R4 - read_messages is required even with add_reactions
+def test_put_reaction_forbidden_without_read_messages(
+    db_conn, http_client, test_guild, test_message, test_session
+):
+    _set_everyone_permissions(db_conn, test_guild.id, ADD_REACTIONS)
+
+    response = _put(http_client, test_session.access_token, test_message.id, {"unicode_emoji": THUMBS_UP})
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
+
+
 # R4 (success path pins the add_reactions bit)
 def test_put_reaction_allowed_by_exact_add_reactions_role(
     db_conn, http_client, test_guild, test_message, test_user, test_session
@@ -910,16 +924,37 @@ def test_delete_absent_reaction_is_idempotent(http_client, test_message, test_se
     assert response.status_code == 204
 
 
-# R4 - removing the caller's own reaction needs no permission
-def test_delete_own_reaction_without_permissions(
+# R4 - removing the caller's own reaction still needs read_messages
+def test_delete_own_reaction_forbidden_without_read_messages(
     db_conn, http_client, test_guild, test_message, test_session, test_user
 ):
-    _set_everyone_permissions(db_conn, test_guild.id, 0)
+    _set_everyone_permissions(db_conn, test_guild.id, ADD_REACTIONS)
+    _insert_reaction(db_conn, test_message.id, test_user.id, unicode_emoji=THUMBS_UP)
+
+    response = _delete(http_client, test_session.access_token, test_message.id, unicode_emoji=THUMBS_UP)
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM app.message_reactions"
+            " WHERE message_id = %s AND user_id = %s",
+            (int(test_message.id), int(test_user.id)),
+        )
+        assert cur.fetchone()["n"] == 1
+
+
+def test_delete_own_reaction_with_read_messages(
+    db_conn, http_client, test_guild, test_message, test_session, test_user
+):
+    _set_everyone_permissions(db_conn, test_guild.id, READ_MESSAGES)
     _insert_reaction(db_conn, test_message.id, test_user.id, unicode_emoji=THUMBS_UP)
 
     response = _delete(http_client, test_session.access_token, test_message.id, unicode_emoji=THUMBS_UP)
 
     assert response.status_code == 204
+    assert _message_reactions(http_client, test_session.access_token, test_message.id) == []
 
 
 # R3 - no emoji parameter removes all of the caller's reactions
@@ -944,6 +979,26 @@ def test_delete_other_reaction_forbidden_without_delete_reactions(
     caller, caller_token = _other_session(http_client, "nodelete")
     _create_role(db_conn, test_guild.id, "8000001", "higher", position=100, permissions=0)
     _assign_role(db_conn, test_guild.id, caller["id"], "8000001")
+
+    _insert_reaction(db_conn, test_message.id, test_user.id, unicode_emoji=THUMBS_UP)
+
+    response = _delete(
+        http_client, caller_token, test_message.id, unicode_emoji=THUMBS_UP, user_id=test_user.id
+    )
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
+
+
+# R4 - read_messages is required even with delete_reactions and a higher role
+def test_delete_other_reaction_forbidden_without_read_messages(
+    db_conn, http_client, test_guild, test_message, test_user
+):
+    _set_everyone_permissions(db_conn, test_guild.id, DELETE_REACTIONS)
+
+    caller, caller_token = _other_session(http_client, "noread")
+    _create_role(db_conn, test_guild.id, "8000005", "higher", position=100, permissions=0)
+    _assign_role(db_conn, test_guild.id, caller["id"], "8000005")
 
     _insert_reaction(db_conn, test_message.id, test_user.id, unicode_emoji=THUMBS_UP)
 

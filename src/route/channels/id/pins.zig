@@ -265,7 +265,7 @@ pub inline fn getHandle(
 
 /// R1 - user must be logged
 /// R2 - the channel exists
-/// R3 - user has rights to add pins
+/// R3 - user has rights to view messages and add pins
 /// R4 - the message exists, belongs to the channel and is not deleted
 ///      (else 404 "Message not found")
 /// R5 - the message is pinned (idempotent); a real transition dispatches a
@@ -344,7 +344,7 @@ const PutTask = struct {
                     .guild_id = this.channel_exists_task.?.result.?.guild_id,
                     .channel_id = this.payload.channel_id,
                     .user_id = this.bearer_middleware_task.?.result.?,
-                    .required = .{ .add_pins = true },
+                    .required = .{ .read_messages = true, .add_pins = true },
                 }));
             }
 
@@ -518,7 +518,7 @@ pub inline fn putHandle(
 
 /// R1 - user must be logged
 /// R2 - the channel exists
-/// R3 - user has rights to delete pins
+/// R3 - user has rights to view messages and delete pins
 /// R4 - the message exists, belongs to the channel and is not deleted
 ///      (else 404 "Message not found")
 /// R5 - the message is unpinned (idempotent); a real transition dispatches a
@@ -597,7 +597,7 @@ const DeleteTask = struct {
                     .guild_id = this.channel_exists_task.?.result.?.guild_id,
                     .channel_id = this.payload.channel_id,
                     .user_id = this.bearer_middleware_task.?.result.?,
-                    .required = .{ .delete_pins = true },
+                    .required = .{ .read_messages = true, .delete_pins = true },
                 }));
             }
 

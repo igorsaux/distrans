@@ -2714,7 +2714,7 @@ paths:
       - $ref: '#/components/parameters/ChannelId'
       - $ref: '#/components/parameters/MessageId'
     put:
-      summary: Pin a message (add_pins required)
+      summary: Pin a message (read_messages and add_pins required)
       description: >-
         Idempotent. The message must exist in the path channel and not be
         deleted. A real `false -> true` transition dispatches a
@@ -2735,7 +2735,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
-          description: Missing permissions (add_pins required)
+          description: Missing permissions (read_messages and add_pins required)
           content:
             application/json:
               schema:
@@ -2747,7 +2747,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
     delete:
-      summary: Unpin a message (delete_pins required)
+      summary: Unpin a message (read_messages and delete_pins required)
       description: >-
         Idempotent. The message must exist in the path channel and not be
         deleted. A real `true -> false` transition dispatches a
@@ -2768,7 +2768,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
-          description: Missing permissions (delete_pins required)
+          description: Missing permissions (read_messages and delete_pins required)
           content:
             application/json:
               schema:
@@ -2816,9 +2816,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
     patch:
-      summary: Edit a message (author only, no permission checks)
+      summary: Edit a message (author only; read_messages required)
       description: >-
-        Only the author of the message may edit it.
+        The caller must have `read_messages` on the message's channel and be
+        the author of the message.
         `content` follows the same rules as POST /channels/{channel_id}/messages.
         An optional `embeds` replaces the message's embeds: absent leaves them
         unchanged, an explicit `null` or an empty array clears them, and a
@@ -2881,7 +2882,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
-          description: The caller is not the author of the message
+          description: Missing permissions (read_messages required) or the caller is not the author
           content:
             application/json:
               schema:
@@ -2893,12 +2894,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
     delete:
-      summary: Delete a message (author, or a strictly higher moderator with delete_messages)
+      summary: Delete a message (read_messages required; author, or a strictly higher moderator with delete_messages)
       description: >-
-        The author can always delete the own message without any permissions.
-        A non-author needs delete_messages on the message's channel and must
-        be strictly higher in the role hierarchy than the author. Deletion is
-        a soft delete: content is wiped and the message becomes anonymous.
+        The caller must have `read_messages` on the message's channel. The
+        author may then delete the own message without any further permissions.
+        A non-author also needs delete_messages on the message's channel and
+        must be strictly higher in the role hierarchy than the author. Deletion
+        is a soft delete: content is wiped and the message becomes anonymous.
       tags: [messages]
       operationId: deleteMessage
       security:
@@ -2915,7 +2917,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
-          description: Missing permissions (non-author without delete_messages or not strictly higher than the author)
+          description: Missing permissions (read_messages required; non-author without delete_messages or not strictly higher than the author)
           content:
             application/json:
               schema:
@@ -2930,7 +2932,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/MessageId'
     put:
-      summary: Add your own reaction (add_reactions required, idempotent)
+      summary: Add your own reaction (read_messages and add_reactions required, idempotent)
       description: >-
         Adds the caller's reaction. Re-adding the same emoji is idempotent
         (still 204). A custom `emoji_id` must belong to the message's guild.
@@ -2970,7 +2972,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
-          description: Missing permissions (add_reactions required)
+          description: Missing permissions (read_messages and add_reactions required)
           content:
             application/json:
               schema:
@@ -2983,14 +2985,16 @@ paths:
                 $ref: '#/components/schemas/Error'
     delete:
       summary: >-
-        Remove a reaction (own freely; another user's with delete_reactions and
-        a strictly higher role)
+        Remove a reaction (read_messages required; another user's also requires
+        delete_reactions and a strictly higher role)
       description: >-
+        The caller must have `read_messages` on the message's channel.
         Removes the caller's reaction with the given emoji; with no emoji
         parameter, removes all of the caller's reactions on the message.
-        With `user_id`, removes that user's reaction instead, which requires
-        `delete_reactions` on the channel and being strictly higher in the role
-        hierarchy than the target. Idempotent (a missing reaction is still 204).
+        With `user_id`, removes that user's reaction instead, which additionally
+        requires `delete_reactions` on the channel and being strictly higher in
+        the role hierarchy than the target. Idempotent (a missing reaction is
+        still 204).
       tags: [messages]
       operationId: deleteMessageReaction
       security:
@@ -3038,8 +3042,9 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           description: >-
-            Missing permissions (removing another user's reaction without
-            delete_reactions or without being strictly higher than the target)
+            Missing permissions (read_messages required; removing another
+            user's reaction also requires delete_reactions and being strictly
+            higher than the target)
           content:
             application/json:
               schema:

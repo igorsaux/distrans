@@ -3,10 +3,12 @@
 #
 # GET    - R1 logged in; R2 channel exists; R3 read_messages on the channel;
 #          R4 keyset-paginated pinned message ids (limit/before/after)
-# PUT    - R1 logged in; R2 channel exists; R3 add_pins; R4 message exists in
-#          the channel; R5 idempotent pin + message_pinned event
-# DELETE - R1 logged in; R2 channel exists; R3 delete_pins; R4 message exists in
-#          the channel; R5 idempotent unpin + message_unpinned event
+# PUT    - R1 logged in; R2 channel exists; R3 read_messages + add_pins; R4
+#          message exists in the channel; R5 idempotent pin + message_pinned
+#          event
+# DELETE - R1 logged in; R2 channel exists; R3 read_messages + delete_pins; R4
+#          message exists in the channel; R5 idempotent unpin +
+#          message_unpinned event
 
 import sys
 from pathlib import Path
@@ -257,6 +259,18 @@ def test_put_pin_forbidden_without_add_pins(
     assert response.json()["message"] == "Missing permissions"
 
 
+# R3 - read_messages is required even with add_pins
+def test_put_pin_forbidden_without_read_messages(
+    db_conn, http_client, test_guild, test_channel, test_message, test_session
+):
+    _set_everyone_permissions(db_conn, test_guild.id, ADD_PINS)
+
+    response = _put(http_client, test_session.access_token, test_channel.id, test_message.id)
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
+
+
 # R3 (success path pins the add_pins bit)
 def test_put_pin_allowed_by_exact_add_pins_role(
     db_conn, http_client, test_guild, test_channel, test_message, test_session, test_user
@@ -366,6 +380,24 @@ def test_delete_pin_forbidden_without_delete_pins(
     _set_everyone_permissions(db_conn, test_guild.id, READ_MESSAGES)
 
     response = _delete(http_client, test_session.access_token, test_channel.id, "5002")
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
+
+
+# R3 - read_messages is required even with delete_pins
+def test_delete_pin_forbidden_without_read_messages(
+    db_conn,
+    http_client,
+    test_guild,
+    test_channel,
+    test_session,
+    test_user,
+):
+    _insert_message(db_conn, test_channel.id, test_user.id, "5003", pinned=True)
+    _set_everyone_permissions(db_conn, test_guild.id, DELETE_PINS)
+
+    response = _delete(http_client, test_session.access_token, test_channel.id, "5003")
 
     assert response.status_code == 403
     assert response.json()["message"] == "Missing permissions"

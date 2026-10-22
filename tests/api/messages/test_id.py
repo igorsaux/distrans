@@ -1,10 +1,11 @@
 # Tests for /api/messages/{message_id} (GET, PATCH, DELETE).
 #
 # GET    - R1 logged in; R2 message exists; R3 read_messages on the channel
-# PATCH  - R1 logged in; R2 message exists; R3 author only; R4 content validation
-# DELETE - R1 logged in; R2 message exists; R3 author deletes freely;
-#          R4 non-author needs delete_messages; R5 non-author strictly higher
-#          than the author
+# PATCH  - R1 logged in; R2 message exists; R3 read_messages and author only;
+#          R4 content validation
+# DELETE - R1 logged in; R2 message exists; R3 read_messages;
+#          R4 author deletes freely, non-author needs delete_messages;
+#          R5 non-author strictly higher than the author
 
 import sys
 from pathlib import Path
@@ -258,7 +259,7 @@ def test_patch_non_existent_message(http_client, test_session):
     assert body["message"] == "Message not found"
 
 
-# R3 - only the author may edit (no permission checks)
+# R3 - the author needs read_messages and only the author may edit
 
 
 def test_patch_message_forbidden_for_non_author_even_with_delete_messages(
@@ -428,13 +429,13 @@ def test_patch_message_content_normalized(http_client, test_message, test_sessio
     assert stored.json()["content"] == "AB"
 
 
-# R3/R4 - the author can edit even with no permissions
+# R3 - the author needs read_messages to edit
 
 
-def test_patch_message_by_author_without_permissions(
+def test_patch_message_by_author_with_read_messages(
     db_conn, http_client, test_guild, test_message, test_session
 ):
-    _set_everyone_permissions(db_conn, test_guild.id, 0)
+    _set_everyone_permissions(db_conn, test_guild.id, READ_MESSAGES)
 
     response = _patch_message(
         http_client, test_session, test_message.id, json={"content": "edited"}
@@ -445,6 +446,28 @@ def test_patch_message_by_author_without_permissions(
     body = response.json()
     assert "edited_at" in body
     assert body["edited_at"] > 0
+
+
+def test_patch_message_forbidden_without_read_messages(
+    db_conn, http_client, test_guild, test_message, test_session
+):
+    _set_everyone_permissions(db_conn, test_guild.id, 0)
+
+    response = _patch_message(
+        http_client, test_session, test_message.id, json={"content": "edited"}
+    )
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT content FROM app.messages WHERE id = %s",
+            (int(test_message.id),),
+        )
+        row = cur.fetchone()
+
+    assert row["content"] == test_message.content
 
 
 def test_patch_message_success(db_conn, http_client, test_message, test_session):
@@ -486,13 +509,13 @@ def test_delete_non_existent_message(http_client, test_session):
     assert body["message"] == "Message not found"
 
 
-# R3 - the author may delete the own message without any permissions
+# R3 - the author needs read_messages to delete the own message
 
 
-def test_delete_own_message_without_permissions(
+def test_delete_own_message_with_read_messages(
     db_conn, http_client, test_guild, test_message, test_session
 ):
-    _set_everyone_permissions(db_conn, test_guild.id, 0)
+    _set_everyone_permissions(db_conn, test_guild.id, READ_MESSAGES)
 
     response = _delete_message(http_client, test_session, test_message.id)
 
@@ -514,6 +537,27 @@ def test_delete_own_message_without_permissions(
     assert row["content"] == ""
     assert row["author_id"] is None
     assert row["deleted_at"] is not None
+
+
+def test_delete_own_message_forbidden_without_read_messages(
+    db_conn, http_client, test_guild, test_message, test_session
+):
+    _set_everyone_permissions(db_conn, test_guild.id, 0)
+
+    response = _delete_message(http_client, test_session, test_message.id)
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT deleted_at FROM app.messages WHERE id = %s",
+            (int(test_message.id),),
+        )
+        row = cur.fetchone()
+
+    assert row is not None
+    assert row["deleted_at"] is None
 
 
 # R4 - a non-author needs delete_messages
@@ -543,9 +587,9 @@ def test_delete_message_by_non_author_without_delete_messages(
 def test_delete_message_by_non_author_with_equal_position(
     db_conn, http_client, test_guild, test_message, test_session
 ):
-    # @everyone (position 0) grants delete_messages, but the author's highest
-    # position is 0 too: not strictly higher.
-    _set_everyone_permissions(db_conn, test_guild.id, DELETE_MESSAGES)
+    # @everyone (position 0) grants read_messages and delete_messages, but the
+    # author's highest position is 0 too: not strictly higher.
+    _set_everyone_permissions(db_conn, test_guild.id, READ_MESSAGES | DELETE_MESSAGES)
 
     _, other_token = _create_other_session(http_client)
 
@@ -563,7 +607,7 @@ def test_delete_message_by_non_author_with_equal_position(
 def test_delete_message_by_non_author_with_higher_position(
     db_conn, http_client, test_guild, test_message, test_session
 ):
-    _set_everyone_permissions(db_conn, test_guild.id, 0)
+    _set_everyone_permissions(db_conn, test_guild.id, READ_MESSAGES)
 
     other_user, other_token = _create_other_session(http_client)
 
@@ -578,6 +622,28 @@ def test_delete_message_by_non_author_with_higher_position(
     )
 
     assert response.status_code == 204
+
+
+# R3 - a non-author still needs read_messages
+def test_delete_message_by_non_author_without_read_messages(
+    db_conn, http_client, test_guild, test_message, test_session
+):
+    _set_everyone_permissions(db_conn, test_guild.id, DELETE_MESSAGES)
+
+    other_user, other_token = _create_other_session(http_client)
+
+    _create_role(
+        db_conn, test_guild.id, "1111112", "mods", position=1, permissions=0
+    )
+    _assign_role(db_conn, test_guild.id, other_user["id"], "1111112")
+
+    response = http_client.delete(
+        _message_url(test_message.id),
+        headers={"Authorization": f"Bearer {other_token}"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
 
 
 # ---------------------------------------------------------------------------

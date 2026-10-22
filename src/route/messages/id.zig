@@ -289,9 +289,10 @@ pub inline fn getHandle(
 
 /// R1 - user must be logged
 /// R2 - the message exists
-/// R3 - the author may delete the own message without any permissions;
-///      a non-author needs delete_messages and must be strictly higher
-///      than the author
+/// R3 - user must have read_messages on the message's channel
+/// R4 - the author may delete the own message without any further permissions;
+///      a non-author needs delete_messages
+/// R5 - a non-author must be strictly higher than the author
 const DeleteTask = struct {
     pub const Task = root.http.Task;
 
@@ -355,41 +356,49 @@ const DeleteTask = struct {
             }
         }
 
-        // R3
+        // R3, R4
         // A webhook message has no author, so it is never "own"; deleting it
         // needs `delete_messages` and has no author to outrank.
+        const caller_id = this.bearer_middleware_task.?.result.?;
         const delete_author_id = this.message_is_exists_task.?.result.?.author_id;
+        const is_author = delete_author_id != null and delete_author_id.? == caller_id;
 
-        if (delete_author_id == null or delete_author_id.? != this.bearer_middleware_task.?.result.?) {
-            // R3
-            // await this.check_user_channel_rights_task
-            {
-                if (this.check_user_channel_rights_task == null) {
-                    this.check_user_channel_rights_task = .from(.init(this.db.?, .{
-                        .guild_id = this.message_is_exists_task.?.result.?.guild_id,
-                        .channel_id = this.message_is_exists_task.?.result.?.channel_id,
-                        .user_id = this.bearer_middleware_task.?.result.?,
-                        .required = .{ .delete_messages = true },
-                    }));
-                }
+        var required: root.types.Permissions = .{ .read_messages = true };
 
-                while (this.check_user_channel_rights_task.?.await()) |res| {
-                    return res.discard();
-                }
+        if (!is_author) {
+            required.delete_messages = true;
+        }
 
-                if (!this.check_user_channel_rights_task.?.result) {
-                    return root.route.generic.responseErrorMessage(this.response, .forbidden, "Missing permissions");
-                }
+        // R3, R4
+        // await this.check_user_channel_rights_task
+        {
+            if (this.check_user_channel_rights_task == null) {
+                this.check_user_channel_rights_task = .from(.init(this.db.?, .{
+                    .guild_id = this.message_is_exists_task.?.result.?.guild_id,
+                    .channel_id = this.message_is_exists_task.?.result.?.channel_id,
+                    .user_id = caller_id,
+                    .required = required,
+                }));
             }
 
-            // R3
+            while (this.check_user_channel_rights_task.?.await()) |res| {
+                return res.discard();
+            }
+
+            if (!this.check_user_channel_rights_task.?.result) {
+                return root.route.generic.responseErrorMessage(this.response, .forbidden, "Missing permissions");
+            }
+        }
+
+        // R5
+        if (!is_author) {
             if (delete_author_id) |delete_author| {
                 // await this.is_higher_than_other_task
                 {
                     if (this.is_higher_than_other_task == null) {
                         this.is_higher_than_other_task = .from(.init(this.db.?, .{
                             .guild_id = this.message_is_exists_task.?.result.?.guild_id,
-                            .user_a_id = this.bearer_middleware_task.?.result.?,
+                            .user_a_id = caller_id,
                             .user_b_id = delete_author,
                         }));
                     }
@@ -430,7 +439,7 @@ const DeleteTask = struct {
 
         // A self-delete is not a moderation action and is not audited; any
         // other delete (including a webhook message, which has no author) is.
-        if (delete_author_id == null or delete_author_id.? != this.bearer_middleware_task.?.result.?) {
+        if (!is_author) {
             // await this.audit_log
             {
                 if (this.audit_log == null) {
@@ -542,7 +551,7 @@ pub inline fn deleteHandle(
 
 /// R1 - user must be logged
 /// R2 - the message exists
-/// R3 - only the author may edit the message (no permission checks)
+/// R3 - user must have read_messages on the message's channel and be the author
 /// R4 - "content" must be present, a string, valid UTF-8; forbidden codepoints
 ///      are stripped; after stripping the content is not empty and not too long
 /// R5 - optional "embeds" replaces the message embeds; explicit null or an empty
@@ -578,6 +587,7 @@ pub const PatchTask = struct {
     bearer_middleware_task: ?root.middleware.bearer.BearerMiddleware.Lazy = null,
     db: ?*root.db.Connection = null,
     message_is_exists_task: ?root.repo.messages.IsExists.Lazy = null,
+    check_user_channel_rights_task: ?root.repo.rights.CheckUserChannelRights.Lazy = null,
     content: ?Content = null,
     count_attachments_task: ?root.repo.files.CountExisting.Lazy = null,
     filter_mention_users_task: ?root.repo.mentions.FilterValidUsers.Lazy = null,
@@ -632,6 +642,27 @@ pub const PatchTask = struct {
 
             if (this.message_is_exists_task.?.result == null) {
                 return root.route.generic.responseErrorMessage(this.response, .not_found, "Message not found");
+            }
+        }
+
+        // R3
+        // await this.check_user_channel_rights_task
+        {
+            if (this.check_user_channel_rights_task == null) {
+                this.check_user_channel_rights_task = .from(.init(this.db.?, .{
+                    .guild_id = this.message_is_exists_task.?.result.?.guild_id,
+                    .channel_id = this.message_is_exists_task.?.result.?.channel_id,
+                    .user_id = this.bearer_middleware_task.?.result.?,
+                    .required = .{ .read_messages = true },
+                }));
+            }
+
+            while (this.check_user_channel_rights_task.?.await()) |res| {
+                return res.discard();
+            }
+
+            if (!this.check_user_channel_rights_task.?.result) {
+                return root.route.generic.responseErrorMessage(this.response, .forbidden, "Missing permissions");
             }
         }
 
@@ -918,6 +949,11 @@ pub const PatchTask = struct {
         if (this.message_is_exists_task) |*t| {
             t.dispose();
             this.message_is_exists_task = null;
+        }
+
+        if (this.check_user_channel_rights_task) |*t| {
+            t.dispose();
+            this.check_user_channel_rights_task = null;
         }
 
         if (this.count_attachments_task) |*t| {
