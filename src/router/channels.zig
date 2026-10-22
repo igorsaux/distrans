@@ -86,6 +86,19 @@ pub inline fn handle(
             }
         }
 
+        if (root.utils.eqlMaybe(u8, part, "messages")) {
+            // /api/channels/{channel_id}/pins/messages
+
+            if (it.next() != null) {
+                return try root.route.generic.notFoundTask(response);
+            }
+
+            return switch (request.method) {
+                .get => try root.route.channels.id.pins.messages.getHandle(allocator, request, response, channel_id),
+                else => try root.route.generic.methodNotAllowedTask(response, "GET"),
+            };
+        }
+
         // /api/channels/{channel_id}/pins/{message_id}
 
         if (it.next() != null) {

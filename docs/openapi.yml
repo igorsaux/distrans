@@ -2662,7 +2662,9 @@ paths:
       summary: List pinned message ids (keyset pagination)
       description: >-
         Returns the ids (decimal strings, ascending) of the channel's pinned
-        non-deleted messages. `before` and `after` are mutually exclusive.
+        non-deleted messages. `before` and `after` are mutually exclusive. Use
+        `/channels/{channel_id}/pins/messages` to fetch the full pinned
+        messages in one response.
       tags: [messages]
       operationId: getChannelPins
       security:
@@ -2691,6 +2693,63 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Id'
+        '400':
+          description: Bad parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing permissions (read_messages required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /channels/{channel_id}/pins/messages:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      summary: List full pinned messages (keyset pagination)
+      description: >-
+        Returns the channel's pinned, non-deleted messages as full `Message`
+        objects, ascending by message id. Unpinned and soft-deleted messages
+        are excluded. `before` and `after` are mutually exclusive.
+      tags: [messages]
+      operationId: getChannelPinnedMessages
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Default 50, max `api.messages.max_messages_limit`
+        - name: before
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+        - name: after
+          in: query
+          schema:
+            $ref: '#/components/schemas/Id'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Message'
         '400':
           description: Bad parameters
           content:

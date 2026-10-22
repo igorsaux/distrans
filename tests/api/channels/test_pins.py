@@ -3,6 +3,8 @@
 #
 # GET    - R1 logged in; R2 channel exists; R3 read_messages on the channel;
 #          R4 keyset-paginated pinned message ids (limit/before/after)
+# GET /pins/messages - same auth/permissions and pagination, but full pinned
+#          message objects (pinned and non-deleted only, ascending)
 # PUT    - R1 logged in; R2 channel exists; R3 read_messages + add_pins; R4
 #          message exists in the channel; R5 idempotent pin + message_pinned
 #          event
@@ -41,8 +43,18 @@ def _pin_url(channel_id, message_id):
     return f"/api/channels/{channel_id}/pins/{message_id}"
 
 
+def _pins_messages_url(channel_id):
+    return f"/api/channels/{channel_id}/pins/messages"
+
+
 def _list(http_client, token, channel_id, **params):
     return http_client.get(_pins_url(channel_id), headers=_auth(token), params=params)
+
+
+def _list_messages(http_client, token, channel_id, **params):
+    return http_client.get(
+        _pins_messages_url(channel_id), headers=_auth(token), params=params
+    )
 
 
 def _put(http_client, token, channel_id, message_id):
@@ -59,6 +71,14 @@ def _insert_message(db_conn, channel_id, author_id, message_id, pinned=False):
             "INSERT INTO app.messages (id, channel_id, guild_id, author_id, content, pinned)"
             " SELECT %s, c.id, c.guild_id, %s, %s, %s FROM app.channels c WHERE c.id = %s",
             (message_id, author_id, f"msg-{message_id}", pinned, channel_id),
+        )
+
+
+def _soft_delete_message(db_conn, message_id):
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE app.messages SET deleted_at = NOW(), content = '' WHERE id = %s",
+            (message_id,),
         )
 
 
@@ -224,6 +244,152 @@ def test_get_pins_empty(db_conn, http_client, test_channel, test_user, test_sess
     _insert_message(db_conn, test_channel.id, test_user.id, "3001", pinned=False)
 
     response = _list(http_client, test_session.access_token, test_channel.id)
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+# ---------------------------------------------------------------------------
+# GET /pins/messages
+# ---------------------------------------------------------------------------
+
+
+def test_get_pinned_messages_unauthorized(http_client, test_channel):
+    response = http_client.get(_pins_messages_url(test_channel.id))
+
+    assert response.status_code == 401
+
+
+def test_get_pinned_messages_non_existent_channel(http_client, test_session):
+    response = _list_messages(http_client, test_session.access_token, "1")
+
+    assert response.status_code == 404
+    assert response.json()["message"] == "Channel not found"
+
+
+def test_get_pinned_messages_unknown_parameter(
+    http_client, test_channel, test_session
+):
+    response = _list_messages(
+        http_client, test_session.access_token, test_channel.id, foobar=2
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == "Unknown parameter"
+
+
+@pytest.mark.parametrize(
+    "param_key,param_value",
+    [
+        ("limit", "foo"),
+        ("before", "foo"),
+        ("after", "foo"),
+    ],
+)
+def test_get_pinned_messages_bad_parameter(
+    http_client, test_channel, test_session, param_key, param_value
+):
+    response = _list_messages(
+        http_client, test_session.access_token, test_channel.id, **{param_key: param_value}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == f"Bad '{param_key}' parameter"
+
+
+def test_get_pinned_messages_mutually_exclusive(
+    http_client, test_channel, test_session
+):
+    response = _list_messages(
+        http_client, test_session.access_token, test_channel.id, before="1", after="2"
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == (
+        "Parameters 'before' and 'after' are mutually exclusive"
+    )
+
+
+def test_get_pinned_messages_bad_limit_range(
+    http_client, test_channel, test_session
+):
+    response = _list_messages(
+        http_client, test_session.access_token, test_channel.id, limit=0
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == "Bad 'limit' parameter"
+
+
+# R3
+def test_get_pinned_messages_forbidden_without_read_messages(
+    db_conn, http_client, test_guild, test_channel, test_session
+):
+    _set_everyone_permissions(db_conn, test_guild.id, 0)
+
+    response = _list_messages(http_client, test_session.access_token, test_channel.id)
+
+    assert response.status_code == 403
+    assert response.json()["message"] == "Missing permissions"
+
+
+# R4
+def test_get_pinned_messages_lists_pinned_non_deleted_ascending(
+    db_conn, http_client, test_channel, test_user, test_session
+):
+    _insert_message(db_conn, test_channel.id, test_user.id, "1001", pinned=True)
+    _insert_message(db_conn, test_channel.id, test_user.id, "1002", pinned=False)
+    _insert_message(db_conn, test_channel.id, test_user.id, "1003", pinned=True)
+    _insert_message(db_conn, test_channel.id, test_user.id, "1004", pinned=True)
+    _soft_delete_message(db_conn, "1004")
+
+    response = _list_messages(http_client, test_session.access_token, test_channel.id)
+
+    assert response.status_code == 200
+
+    body = response.json()
+    assert [message["id"] for message in body] == ["1001", "1003"]
+    assert all(message["pinned"] is True for message in body)
+
+    assert body[0]["channel_id"] == str(test_channel.id)
+    assert body[0]["content"] == "msg-1001"
+
+
+# R4
+def test_get_pinned_messages_keyset_pagination(
+    db_conn, http_client, test_channel, test_user, test_session
+):
+    for mid in ("2001", "2002", "2003", "2004"):
+        _insert_message(db_conn, test_channel.id, test_user.id, mid, pinned=True)
+
+    # Default (no anchor) is "last": the newest `limit` pins, ascending.
+    response = _list_messages(
+        http_client, test_session.access_token, test_channel.id, limit=2
+    )
+
+    assert response.status_code == 200
+    assert [message["id"] for message in response.json()] == ["2003", "2004"]
+
+    response = _list_messages(
+        http_client, test_session.access_token, test_channel.id, before="2003"
+    )
+
+    assert [message["id"] for message in response.json()] == ["2001", "2002"]
+
+    response = _list_messages(
+        http_client, test_session.access_token, test_channel.id, after="2002"
+    )
+
+    assert [message["id"] for message in response.json()] == ["2003", "2004"]
+
+
+# R4
+def test_get_pinned_messages_empty(
+    db_conn, http_client, test_channel, test_user, test_session
+):
+    _insert_message(db_conn, test_channel.id, test_user.id, "3002", pinned=False)
+
+    response = _list_messages(http_client, test_session.access_token, test_channel.id)
 
     assert response.status_code == 200
     assert response.json() == []

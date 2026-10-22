@@ -4,6 +4,7 @@
 const std = @import("std");
 
 const root = @import("../../../root.zig");
+pub const messages = @import("pins/messages.zig");
 
 const SCOPE = std.log.scoped(.@"/api/channels/{channel_id}/pins");
 
