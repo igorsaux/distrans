@@ -1,6 +1,6 @@
 .{
     .name = .distrans,
-    .version = "1.0.3",
+    .version = "1.0.4",
     .fingerprint = 0x1418eed1ce159525,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

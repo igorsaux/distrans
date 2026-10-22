@@ -13,8 +13,10 @@ const root = @import("../../../root.zig");
 ///
 /// Metadata is readable by any authenticated user, so no rights are required.
 /// The body lists only the ids of present rows changed since `since`
-/// (upserts); hard deletions are not listed. `member_roles` is the caller's
-/// complete current role set, including the implicit `@everyone` role.
+/// (upserts); hard deletions are not listed. `channels` covers every kind of
+/// channel change, including message inserts/edits/deletes (a channel is listed
+/// when any of its messages changed). `member_roles` is the caller's complete
+/// current role set, including the implicit `@everyone` role.
 const GetTask = struct {
     const Task = root.http.Task;
 

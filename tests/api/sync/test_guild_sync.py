@@ -132,6 +132,44 @@ def test_guild_sync_reports_changed_channel(
     assert body2["channels"] == []
 
 
+def test_guild_sync_reports_channel_with_message_change(
+    http_client, test_guild, test_channel
+):
+    token = test_guild.admin_token
+
+    cursor = http_client.get(
+        f"/api/guilds/{test_guild.id}/sync",
+        headers=_headers(token),
+    ).json()["updated_at"]
+
+    time.sleep(0.05)
+
+    # A message insert touches only app.messages; the channel row is unchanged.
+    response = http_client.post(
+        f"/api/channels/{test_channel.id}/messages",
+        headers=_headers(token),
+        json={"content": "sync me"},
+    )
+    assert response.status_code == 201
+
+    body = http_client.get(
+        f"/api/guilds/{test_guild.id}/sync",
+        headers=_headers(token),
+        params={"since": cursor},
+    ).json()
+
+    assert test_channel.id in body["channels"]
+
+    # Advancing to the returned cursor clears the channel from the delta.
+    body2 = http_client.get(
+        f"/api/guilds/{test_guild.id}/sync",
+        headers=_headers(token),
+        params={"since": body["updated_at"]},
+    ).json()
+
+    assert test_channel.id not in body2["channels"]
+
+
 def test_guild_sync_reports_overwrites_with_channel_id(
     http_client, test_guild, test_channel, test_session, db_conn
 ):

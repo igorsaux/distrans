@@ -16,15 +16,35 @@ const SCOPE = std.log.scoped(.repo_sync);
 /// The server cursor is the database's `now()` captured at query start; the
 /// caller stores it and passes it as the next `since`. The `<= cursor.ts`
 /// upper bound keeps the returned set from ever being newer than the cursor.
+///
+/// `channels` means any channel change in the guild, including message changes:
+/// the union covers channel-row updates (metadata, position, ...) and channels
+/// whose messages changed. The union deduplicates channels with both kinds of change.
+/// The message branch is correlated per guild channel so it can use
+/// `messages_channel_updated_idx (channel_id, updated_at)`.
 const GUILD_QUERY: [:0]const u8 =
     \\WITH cursor AS MATERIALIZED (SELECT now() AS ts)
     \\SELECT json_build_object(
     \\  'updated_at', (SELECT (extract(epoch FROM ts) * 1000)::bigint FROM cursor),
-    \\  'channels', (SELECT coalesce(json_agg(c.id::text ORDER BY c.id), '[]'::json)
-    \\                 FROM app.channels c, cursor
-    \\                WHERE c.guild_id = $1
-    \\                  AND c.updated_at > to_timestamp($2::bigint / 1000.0)
-    \\                  AND c.updated_at <= cursor.ts),
+    \\  'channels', (SELECT coalesce(json_agg(id::text ORDER BY id), '[]'::json)
+    \\                 FROM (
+    \\                   SELECT c.id
+    \\                     FROM app.channels c, cursor
+    \\                    WHERE c.guild_id = $1
+    \\                      AND c.updated_at > to_timestamp($2::bigint / 1000.0)
+    \\                      AND c.updated_at <= cursor.ts
+    \\                   UNION
+    \\                   SELECT c.id
+    \\                     FROM app.channels c, cursor
+    \\                    WHERE c.guild_id = $1
+    \\                      AND EXISTS (
+    \\                            SELECT 1
+    \\                              FROM app.messages m
+    \\                             WHERE m.channel_id = c.id
+    \\                               AND m.guild_id = $1
+    \\                               AND m.updated_at > to_timestamp($2::bigint / 1000.0)
+    \\                               AND m.updated_at <= cursor.ts)
+    \\                 ) changed),
     \\  'roles', (SELECT coalesce(json_agg(r.id::text ORDER BY r.id), '[]'::json)
     \\              FROM app.roles r, cursor
     \\             WHERE r.guild_id = $1

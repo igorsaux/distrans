@@ -1095,7 +1095,9 @@ paths:
       description: >-
         Per-guild changed-since delta. Every field is an array of ids of present
         rows whose `updated_at` is newer than `since` (upserts); entity bodies
-        are never returned. `overwrites` carry their `channel_id` because
+        are never returned. `channels` includes any channel change, including
+        channels whose messages were inserted, edited, or soft-deleted since
+        `since`. `overwrites` carry their `channel_id` because
         `(target_type, target_id)` is not unique within a guild. `member_roles`
         is the caller's complete current role-id set (not filtered by `since`),
         because grant/revoke hard-delete the row and a delta cannot express
@@ -5099,6 +5101,9 @@ components:
           $ref: '#/components/schemas/SyncCursor'
         channels:
           type: array
+          description: >-
+            Channels changed in any way since the cursor, including channels
+            with message inserts, edits, or soft deletes.
           items:
             $ref: '#/components/schemas/Id'
         roles:

@@ -54,7 +54,7 @@ pub inline fn handle(
 
             if (part == null) {
                 return switch (request.method) {
-                    .get => try root.route.channels.id.messages_sync.getHandle(allocator, request, response, channel_id),
+                    .get => try root.route.channels.id.messages.sync.getHandle(allocator, request, response, channel_id),
                     else => try root.route.generic.methodNotAllowedTask(response, "GET"),
                 };
             }
