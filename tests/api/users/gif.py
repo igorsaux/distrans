@@ -101,9 +101,22 @@ def make_gif():
     return GOOD_GIF
 
 
-def make_animated_gif():
-    """A valid 3-frame animated GIF89a."""
-    return GOOD_ANIMATED_GIF
+def make_animated_gif(loop=0):
+    """A valid 3-frame GIF89a with the requested Netscape repetition count.
+
+    ``None`` removes the extension, which means play once. Finite GIF values
+    count repetitions after the first play, unlike WebP's total play count.
+    """
+    marker = b"\x21\xff\x0bNETSCAPE2.0\x03\x01"
+    offset = GOOD_ANIMATED_GIF.index(marker)
+    extension_end = offset + len(marker) + 2
+
+    if loop is None:
+        return GOOD_ANIMATED_GIF[:offset] + GOOD_ANIMATED_GIF[extension_end + 1 :]
+
+    data = bytearray(GOOD_ANIMATED_GIF)
+    struct.pack_into("<H", data, offset + len(marker), loop)
+    return bytes(data)
 
 
 def make_gif_with_metadata():

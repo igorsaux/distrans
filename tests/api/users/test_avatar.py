@@ -256,10 +256,16 @@ def test_post_malformed_gif(http_client, test_session, name):
     assert response.json()["message"] == "Bad image"
 
 
-# R4 - an APNG is decoded by the PNG path to its first frame (still webp)
-def test_post_apng_first_frame(http_client, test_session, test_user):
+# R4 - APNG frames and play count survive conversion to animated WebP
+@pytest.mark.parametrize("num_plays", [0, 1, 5])
+def test_post_apng_preserves_animation_loop(
+    http_client, test_session, test_user, num_plays
+):
     response = put_avatar(
-        http_client, test_session, png.make_apng(frames=3), content_type="image/png"
+        http_client,
+        test_session,
+        png.make_apng(frames=3, num_plays=num_plays),
+        content_type="image/png",
     )
 
     assert response.status_code == 200
@@ -268,7 +274,48 @@ def test_post_apng_first_frame(http_client, test_session, test_user):
         http_client, test_session, test_user.id, response.json()["avatar_hash"]
     )
     assert is_webp(image.content)
-    assert not is_animated_webp(image.content)
+    assert is_animated_webp(image.content)
+    assert webp.read_loop(image.content) == num_plays
+
+
+# R4 - the APNG animation frame cap
+def test_post_apng_too_many_frames(http_client, test_session):
+    response = put_avatar(
+        http_client,
+        test_session,
+        png.make_apng_many_frames(frames=webp.AVATAR_MAX_ANIMATION_FRAMES + 1),
+        content_type="image/png",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == "Bad image"
+
+
+# R4 - the APNG animation duration cap
+def test_post_apng_too_long(http_client, test_session):
+    response = put_avatar(
+        http_client, test_session, png.make_apng_long_delay(), content_type="image/png"
+    )
+
+    assert response.status_code == 400
+    assert response.json()["message"] == "Bad image"
+
+
+# R4 / R5 - GIF repetition counts are converted to WebP total play counts
+@pytest.mark.parametrize("gif_loop,webp_loop", [(None, 1), (0, 0), (1, 2), (4, 5)])
+def test_post_gif_preserves_animation_loop(
+    http_client, test_session, test_user, gif_loop, webp_loop
+):
+    payload = gif.make_animated_gif(loop=gif_loop)
+    response = put_avatar(http_client, test_session, payload, content_type="image/gif")
+
+    assert response.status_code == 200
+
+    body = get_avatar(
+        http_client, test_session, test_user.id, response.json()["avatar_hash"]
+    ).content
+    assert is_animated_webp(body)
+    assert webp.read_loop(body) == webp_loop
 
 
 # R4 - the animation frame cap
@@ -362,16 +409,17 @@ def test_post_animated_webp_same_hash(http_client, test_session):
     assert first == second
 
 
-# R4 / R5 - animations are normalized to loop forever
-def test_post_animated_webp_forces_infinite_loop(http_client, test_session, test_user):
-    payload = webp.make_animated_webp(frames=3, loop=5)
+# R4 / R5 - WebP play counts survive conversion, including play-once
+@pytest.mark.parametrize("loop", [0, 1, 5])
+def test_post_animated_webp_preserves_loop(http_client, test_session, test_user, loop):
+    payload = webp.make_animated_webp(frames=3, loop=loop)
 
-    assert webp.read_loop(payload) == 5
+    assert webp.read_loop(payload) == loop
 
     avatar_hash = put_avatar(http_client, test_session, payload).json()["avatar_hash"]
     body = get_avatar(http_client, test_session, test_user.id, avatar_hash).content
 
-    assert webp.read_loop(body) == 0
+    assert webp.read_loop(body) == loop
 
 
 # R4 / R5 - an extended still WebP (VP8X + ALPH) is treated as a still

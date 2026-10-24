@@ -238,10 +238,10 @@ inline fn parseWebpInfo(input: []const u8, limits: Limits) Error!WebpInfo {
     return result;
 }
 
-/// Forces the animated webp loop count to infinite (0). `libwebp_anim` emits
-/// the assembled file itself, so the `webp` muxer (which patches this field)
-/// is not involved. Chunk scanning is done instead of a hardcoded offset.
-inline fn forceInfiniteLoop(data: []u8) void {
+/// Sets the animated WebP play count. Zero means infinite repetition; one means
+/// play once and remain on the last frame. `libwebp_anim` assembles the file
+/// itself, so the WebP muxer is not involved.
+inline fn setAnimationLoop(data: []u8, loop_count: u16) void {
     if (data.len < 12 or !std.mem.eql(u8, data[0..4], "RIFF") or !std.mem.eql(u8, data[8..12], "WEBP")) {
         return;
     }
@@ -258,13 +258,164 @@ inline fn forceInfiniteLoop(data: []u8) void {
         }
 
         if (std.mem.eql(u8, ty, "ANIM") and size >= 6) {
-            std.mem.writeInt(u16, data[data_off + 4 ..][0..2], 0, .little);
+            std.mem.writeInt(u16, data[data_off + 4 ..][0..2], loop_count, .little);
 
             return;
         }
 
         pos = data_off + @as(usize, size) + (@as(usize, size) & 1);
     }
+}
+
+/// Returns the APNG play count, or null for a still PNG. APNG and WebP both use
+/// zero for infinite repetition and otherwise store the total number of plays.
+inline fn apngLoopCount(input: []const u8) ?u16 {
+    const signature = "\x89PNG\r\n\x1a\n";
+
+    if (input.len < signature.len or !std.mem.eql(u8, input[0..signature.len], signature)) {
+        return null;
+    }
+
+    var pos: usize = signature.len;
+
+    while (pos + 12 <= input.len) {
+        const ty = input[pos + 4 ..][0..4];
+        const size: usize = std.mem.readInt(u32, input[pos..][0..4], .big);
+        const data_off = pos + 8;
+        const data_end = std.math.add(usize, data_off, size) catch return null;
+        const next = std.math.add(usize, data_end, 4) catch return null;
+
+        if (next > input.len) {
+            return null;
+        }
+
+        if (std.mem.eql(u8, ty, "acTL")) {
+            if (size < 8) {
+                return null;
+            }
+
+            const plays = std.mem.readInt(u32, input[data_off + 4 ..][0..4], .big);
+
+            return @intCast(@min(plays, std.math.maxInt(u16)));
+        }
+
+        if (std.mem.eql(u8, ty, "IDAT") or std.mem.eql(u8, ty, "IEND")) {
+            return null;
+        }
+
+        pos = next;
+    }
+
+    return null;
+}
+
+inline fn skipGifSubBlocks(input: []const u8, pos: *usize) bool {
+    while (pos.* < input.len) {
+        const size: usize = input[pos.*];
+        pos.* += 1;
+
+        if (size == 0) {
+            return true;
+        }
+
+        if (size > input.len - pos.*) {
+            return false;
+        }
+
+        pos.* += size;
+    }
+
+    return false;
+}
+
+/// GIF stores repetitions after the first play, while WebP stores total plays.
+/// A missing Netscape extension means one play in both formats.
+fn gifLoopCount(input: []const u8) u16 {
+    if (input.len < 13 or
+        (!std.mem.eql(u8, input[0..6], "GIF87a") and !std.mem.eql(u8, input[0..6], "GIF89a")))
+    {
+        return 1;
+    }
+
+    var pos: usize = 13;
+    const screen_flags = input[10];
+
+    if (screen_flags & 0x80 != 0) {
+        const table_size = 3 * (@as(usize, 1) << @intCast((screen_flags & 0x07) + 1));
+
+        if (table_size > input.len - pos) {
+            return 1;
+        }
+
+        pos += table_size;
+    }
+
+    while (pos < input.len) {
+        switch (input[pos]) {
+            0x21 => {
+                if (pos + 2 > input.len) {
+                    return 1;
+                }
+
+                const label = input[pos + 1];
+                pos += 2;
+
+                if (label == 0xff and pos < input.len and input[pos] == 11 and input.len - pos >= 12) {
+                    const identifier = input[pos + 1 ..][0..11];
+                    const netscape = std.mem.eql(u8, identifier, "NETSCAPE2.0") or
+                        std.mem.eql(u8, identifier, "ANIMEXTS1.0");
+
+                    pos += 12;
+
+                    if (netscape and input.len - pos >= 5 and
+                        input[pos] == 3 and input[pos + 1] == 1)
+                    {
+                        const repetitions = std.mem.readInt(u16, input[pos + 2 ..][0..2], .little);
+
+                        if (repetitions == 0) {
+                            return 0;
+                        }
+
+                        return std.math.add(u16, repetitions, 1) catch std.math.maxInt(u16);
+                    }
+                }
+
+                if (!skipGifSubBlocks(input, &pos)) {
+                    return 1;
+                }
+            },
+            0x2c => {
+                if (input.len - pos < 10) {
+                    return 1;
+                }
+
+                const image_flags = input[pos + 9];
+                pos += 10;
+
+                if (image_flags & 0x80 != 0) {
+                    const table_size = 3 * (@as(usize, 1) << @intCast((image_flags & 0x07) + 1));
+
+                    if (table_size > input.len - pos) {
+                        return 1;
+                    }
+
+                    pos += table_size;
+                }
+
+                if (pos < input.len) {
+                    pos += 1;
+                }
+
+                if (!skipGifSubBlocks(input, &pos)) {
+                    return 1;
+                }
+            },
+            0x3b => return 1,
+            else => pos += 1,
+        }
+    }
+
+    return 1;
 }
 
 pub const Limits = struct {
@@ -384,7 +535,7 @@ fn seekPacket(opaque_ptr: ?*anyopaque, offset: i64, whence: c_int) callconv(.c) 
         else => return -1,
     };
 
-    const target = base + offset;
+    const target = std.math.add(i64, base, offset) catch return -1;
 
     if (target < 0 or target > @as(i64, @intCast(io.data.len))) {
         return -1;
@@ -876,14 +1027,24 @@ inline fn process(
     }
 
     if (root.utils.matchMimeType(mime_type, "image/png")) {
+        if (apngLoopCount(input)) |loop_count| {
+            return processFfmpeg(input, .{
+                .demuxers = &.{"apng"},
+                .codec_ids = &.{ffmpeg.AV_CODEC_ID_APNG},
+                .codec_whitelist = "apng",
+                .animated = true,
+                .use_packet_duration = true,
+                .loop_count = loop_count,
+            }, options, limits);
+        }
+
         return processFfmpeg(input, .{
             .demuxers = &.{"png_pipe"},
-            // An APNG is not special-cased: the APNG decoder is accepted and only
-            // its first frame is kept.
             .codec_ids = &.{ ffmpeg.AV_CODEC_ID_PNG, ffmpeg.AV_CODEC_ID_APNG },
             .codec_whitelist = "png,apng",
             .animated = false,
             .use_packet_duration = false,
+            .loop_count = 1,
         }, options, limits);
     }
 
@@ -894,6 +1055,7 @@ inline fn process(
             .codec_whitelist = "gif",
             .animated = true,
             .use_packet_duration = true,
+            .loop_count = gifLoopCount(input),
         }, options, limits);
     }
 
@@ -906,6 +1068,7 @@ inline fn process(
             .codec_whitelist = "mjpeg",
             .animated = false,
             .use_packet_duration = false,
+            .loop_count = 1,
         }, options, limits);
     }
 
@@ -921,6 +1084,7 @@ const FfmpegFormat = struct {
     /// When true, the per-frame delay is taken from the packet duration
     /// (GIF/APNG); otherwise the single frame gets `pts = 0`.
     use_packet_duration: bool,
+    loop_count: u16,
 };
 
 /// Decodes a PNG/APNG/GIF/JPEG body and re-encodes it to WebP. A non-animated
@@ -1126,6 +1290,10 @@ fn processFfmpeg(
             const received = ffmpeg.avcodec_receive_frame(codec_ctx.?, decoded);
 
             if (received < 0) {
+                if (received != ffmpeg.AVERROR(ffmpeg.EAGAIN) and received != ffmpeg.AVERROR_EOF) {
+                    return Error.BadImage;
+                }
+
                 break;
             }
 
@@ -1160,47 +1328,53 @@ fn processFfmpeg(
             ffmpeg.av_frame_unref(decoded);
 
             if (!format.animated) {
-                // Only the first frame of a static format (or of an APNG) is kept.
+                // Only the first frame of a static format is kept.
                 break :decode;
             }
         }
     }
 
-    if (ffmpeg.avcodec_send_packet(codec_ctx.?, null) >= 0) {
-        while (true) {
-            const received = ffmpeg.avcodec_receive_frame(codec_ctx.?, decoded);
+    if (ffmpeg.avcodec_send_packet(codec_ctx.?, null) < 0) {
+        return Error.BadImage;
+    }
 
-            if (received < 0) {
-                break;
+    while (true) {
+        const received = ffmpeg.avcodec_receive_frame(codec_ctx.?, decoded);
+
+        if (received < 0) {
+            if (received != ffmpeg.AVERROR(ffmpeg.EAGAIN) and received != ffmpeg.AVERROR_EOF) {
+                return Error.BadImage;
             }
 
-            if (format.animated) {
-                if (total_duration_ms + min_delay > max_duration) {
-                    ffmpeg.av_frame_unref(decoded);
+            break;
+        }
 
-                    return Error.BadImage;
-                }
+        if (format.animated) {
+            if (total_duration_ms + min_delay > max_duration) {
+                ffmpeg.av_frame_unref(decoded);
 
-                total_duration_ms += min_delay;
-
-                emitFrame(&encoder, options, limits, decoded.?, true, orientation, total_duration_ms - min_delay, min_delay) catch |err| {
-                    ffmpeg.av_frame_unref(decoded);
-
-                    return err;
-                };
-            } else if (encoder == null or encoder.?.frames == 0) {
-                emitFrame(&encoder, options, limits, decoded.?, false, orientation, 0, 0) catch |err| {
-                    ffmpeg.av_frame_unref(decoded);
-
-                    return err;
-                };
+                return Error.BadImage;
             }
 
-            ffmpeg.av_frame_unref(decoded);
+            total_duration_ms += min_delay;
 
-            if (!format.animated) {
-                break;
-            }
+            emitFrame(&encoder, options, limits, decoded.?, true, orientation, total_duration_ms - min_delay, min_delay) catch |err| {
+                ffmpeg.av_frame_unref(decoded);
+
+                return err;
+            };
+        } else if (encoder == null or encoder.?.frames == 0) {
+            emitFrame(&encoder, options, limits, decoded.?, false, orientation, 0, 0) catch |err| {
+                ffmpeg.av_frame_unref(decoded);
+
+                return err;
+            };
+        }
+
+        ffmpeg.av_frame_unref(decoded);
+
+        if (!format.animated) {
+            break;
         }
     }
 
@@ -1208,7 +1382,7 @@ fn processFfmpeg(
         return Error.BadImage;
     }
 
-    return collectEncoded(&encoder.?, limits, format.animated);
+    return collectEncoded(&encoder.?, limits, format.animated, format.loop_count);
 }
 
 /// Decodes a static WebP body and re-encodes it to WebP.
@@ -1266,10 +1440,9 @@ fn processStill(
 
     defer ffmpeg.avformat_close_input(&fmt_ref);
 
-    // Only still images reach this function: animated WebP is validated and
-    // stored verbatim (see `Encode.poll`) because FFmpeg builds that lack the
-    // `webp_anim` demuxer/decoder cannot composite ANMF frames at all. Static
-    // WebP is demuxed by `webp_pipe` (or the legacy `webp` demuxer).
+    // Animated WebP uses WebPAnimDecoder because FFmpeg builds before 9.0
+    // cannot composite ANMF frames. Static WebP is demuxed by `webp_pipe`
+    // (or the legacy `webp` demuxer).
     const demuxer = findDemuxer(&.{ "webp_pipe", "webp" }) orelse {
         return Error.BadImage;
     };
@@ -1375,6 +1548,10 @@ fn processStill(
             const received = ffmpeg.avcodec_receive_frame(codec_ctx.?, decoded);
 
             if (received < 0) {
+                if (received != ffmpeg.AVERROR(ffmpeg.EAGAIN) and received != ffmpeg.AVERROR_EOF) {
+                    return Error.BadImage;
+                }
+
                 break;
             }
 
@@ -1397,28 +1574,40 @@ fn processStill(
         }
     }
 
-    if (ffmpeg.avcodec_send_packet(codec_ctx.?, null) >= 0) {
-        while (ffmpeg.avcodec_receive_frame(codec_ctx.?, decoded) >= 0) {
-            if (encoder.frames + 1 > limits.max_animation_frames) {
-                ffmpeg.av_frame_unref(decoded);
+    if (ffmpeg.avcodec_send_packet(codec_ctx.?, null) < 0) {
+        return Error.BadImage;
+    }
 
+    while (true) {
+        const received = ffmpeg.avcodec_receive_frame(codec_ctx.?, decoded);
+
+        if (received < 0) {
+            if (received != ffmpeg.AVERROR(ffmpeg.EAGAIN) and received != ffmpeg.AVERROR_EOF) {
                 return Error.BadImage;
             }
 
-            encoder.frame.pts = 0;
-            encoder.frame.duration = 0;
-
-            encoder.push(decoded.?) catch |err| {
-                ffmpeg.av_frame_unref(decoded);
-
-                return err;
-            };
-
-            ffmpeg.av_frame_unref(decoded);
+            break;
         }
+
+        if (encoder.frames + 1 > limits.max_animation_frames) {
+            ffmpeg.av_frame_unref(decoded);
+
+            return Error.BadImage;
+        }
+
+        encoder.frame.pts = 0;
+        encoder.frame.duration = 0;
+
+        encoder.push(decoded.?) catch |err| {
+            ffmpeg.av_frame_unref(decoded);
+
+            return err;
+        };
+
+        ffmpeg.av_frame_unref(decoded);
     }
 
-    return collectEncoded(&encoder, limits, false);
+    return collectEncoded(&encoder, limits, false, 1);
 }
 
 /// Decodes an animated WebP body and re-encodes it to an animated WebP. Uses
@@ -1520,7 +1709,7 @@ fn processAnimated(
         return Error.BadImage;
     }
 
-    return collectEncoded(&encoder, limits, true);
+    return collectEncoded(&encoder, limits, true, @intCast(@min(anim_info.loop_count, std.math.maxInt(u16))));
 }
 
 /// Flushes the encoder and gathers the emitted packets into a `Result`.
@@ -1528,6 +1717,7 @@ fn collectEncoded(
     encoder: *Encoder,
     limits: Limits,
     animated: bool,
+    loop_count: u16,
 ) Error!Spec.Result {
     if (ffmpeg.avcodec_send_frame(encoder.ctx, null) < 0) {
         return Error.BadImage;
@@ -1545,6 +1735,10 @@ fn collectEncoded(
         const received = ffmpeg.avcodec_receive_packet(encoder.ctx, out_packet);
 
         if (received < 0) {
+            if (received != ffmpeg.AVERROR(ffmpeg.EAGAIN) and received != ffmpeg.AVERROR_EOF) {
+                return Error.BadImage;
+            }
+
             break;
         }
 
@@ -1578,12 +1772,12 @@ fn collectEncoded(
 
     @memcpy(data, out.items);
 
-    return finishResult(data, animated);
+    return finishResult(data, animated, loop_count);
 }
 
-fn finishResult(data: []u8, animated: bool) Spec.Result {
+fn finishResult(data: []u8, animated: bool, loop_count: u16) Spec.Result {
     if (animated) {
-        forceInfiniteLoop(data);
+        setAnimationLoop(data, loop_count);
     }
 
     var hash: [16]u8 = undefined;
