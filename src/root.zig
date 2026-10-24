@@ -46,6 +46,7 @@ pub var exit: *std.Io.Event = undefined;
 pub var wd: watchdog.Watchdog = undefined;
 
 test {
+    _ = @import("config.zig");
     _ = @import("services/notifications.zig");
     _ = @import("unicode.zig");
     _ = @import("utils.zig");
