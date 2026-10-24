@@ -791,6 +791,41 @@ def test_search_content_substring_and_case_insensitive(
     assert _ids(response) == ["3801"]
 
 
+def test_search_short_content_with_empty_date_range(
+    db_conn, http_client, test_guild, test_channel, test_user, test_session
+):
+    _insert_message(
+        db_conn,
+        message_id="3851",
+        guild_id=test_guild.id,
+        channel_id=test_channel.id,
+        author_id=test_user.id,
+        content="он вне диапазона",
+        created_at="2020-01-01T00:00:00+00:00",
+    )
+    _insert_message(
+        db_conn,
+        message_id="3852",
+        guild_id=test_guild.id,
+        channel_id=test_channel.id,
+        author_id=test_user.id,
+        content="совпадений нет",
+        created_at="2022-01-01T00:00:00+00:00",
+    )
+
+    response = _search(
+        http_client,
+        test_session,
+        test_guild.id,
+        content="он",
+        after="1609459200000",
+        before="1672531200000",
+    )
+
+    assert response.status_code == 200
+    assert _envelope(response) == {"messages": [], "total": 0}
+
+
 def test_search_content_escapes_like_wildcards(
     db_conn, http_client, test_guild, test_channel, test_user, test_session
 ):

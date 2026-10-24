@@ -28,7 +28,8 @@
   },
   "db": {
     "conninfo": "host=localhost dbname=distrans user=admin",
-    "pool": 10
+    "pool": 10,
+    "statement_timeout_ms": 5000
   },
   "api": {
     "guilds": {

@@ -47,7 +47,7 @@ pub const Filters = struct {
 /// Shared `FROM`/`WHERE` of the search and count queries. Covers placeholders
 /// `$1..$14` (the filters); each query appends its own trailing placeholders.
 /// The `LEFT JOIN app.users` is required by the `author_types` filter.
-const FILTERS_FROM: []const u8 =
+const FILTERS_FROM_PREFIX: []const u8 =
     \\FROM app.messages m
     \\LEFT JOIN app.users u ON u.id = m.author_id
     \\WHERE m.guild_id = $1
@@ -57,8 +57,9 @@ const FILTERS_FROM: []const u8 =
     \\  AND ($4::bigint[] IS NULL OR m.mention_user_ids && $4)
     \\  AND ($5::bigint[] IS NULL OR m.mention_role_ids && $5)
     \\  AND ($6::boolean IS NULL OR m.pinned = $6)
-    \\  AND ($7::boolean IS NULL OR $7 = EXISTS (
-    \\        SELECT 1 FROM app.message_attachments ma WHERE ma.message_id = m.id))
+;
+
+const FILTERS_FROM_SUFFIX: []const u8 =
     \\  AND ($8::text IS NULL OR m.content ILIKE '%' || $8 || '%')
     \\  AND ($9::bigint IS NULL OR m.created_at >= to_timestamp($9::bigint::double precision / 1000.0))
     \\  AND ($10::bigint IS NULL OR m.created_at < to_timestamp($10::bigint::double precision / 1000.0))
@@ -70,6 +71,21 @@ const FILTERS_FROM: []const u8 =
     \\        ($12::boolean AND NOT (m.channel_id = ANY($13::bigint[])))
     \\     OR ((NOT $12::boolean) AND m.channel_id = ANY($14::bigint[])))
 ;
+
+inline fn filtersFrom(comptime has_attachments: ?bool) []const u8 {
+    const filter = if (has_attachments) |has|
+        if (has)
+            "  AND $7::boolean AND EXISTS (SELECT 1 FROM app.message_attachments ma WHERE ma.message_id = m.id)\n"
+        else
+            "  AND NOT $7::boolean AND NOT EXISTS (SELECT 1 FROM app.message_attachments ma WHERE ma.message_id = m.id)\n"
+    else
+        \\  AND ($7::boolean IS NULL OR $7 = EXISTS (
+        \\        SELECT 1 FROM app.message_attachments ma WHERE ma.message_id = m.id))
+        \\
+    ;
+
+    return FILTERS_FROM_PREFIX ++ filter ++ FILTERS_FROM_SUFFIX;
+}
 
 const PAGE_SELECT: []const u8 =
     \\SELECT m.id, m.author_id, m.content, m.created_at, m.reply_to_id, m.edited_at, m.embeds,
@@ -94,11 +110,58 @@ const PAGE_SELECT: []const u8 =
 
 /// `ORDER BY` direction cannot be a bind parameter, so the page query exists in
 /// two spellings (`newest` = descending, `oldest` = ascending); `LIMIT $15` is
-/// the page size and `OFFSET $16` the page start.
-const PAGE_QUERY_DESC: [:0]const u8 = PAGE_SELECT ++ "\n" ++ FILTERS_FROM ++ "\nORDER BY m.id DESC\nLIMIT $15 OFFSET $16;";
-const PAGE_QUERY_ASC: [:0]const u8 = PAGE_SELECT ++ "\n" ++ FILTERS_FROM ++ "\nORDER BY m.id ASC\nLIMIT $15 OFFSET $16;";
+/// the page size and `OFFSET $16` the page start. Active attachment filters have
+/// their own spellings so PostgreSQL can plan them as semi/anti joins.
+const PAGE_QUERY_DESC: [:0]const u8 = PAGE_SELECT ++ "\n" ++ filtersFrom(null) ++ "\nORDER BY m.id DESC\nLIMIT $15 OFFSET $16;";
+const PAGE_QUERY_ASC: [:0]const u8 = PAGE_SELECT ++ "\n" ++ filtersFrom(null) ++ "\nORDER BY m.id ASC\nLIMIT $15 OFFSET $16;";
+const PAGE_QUERY_DESC_ATTACHMENTS: [:0]const u8 = PAGE_SELECT ++ "\n" ++ filtersFrom(true) ++ "\nORDER BY m.id DESC\nLIMIT $15 OFFSET $16;";
+const PAGE_QUERY_ASC_ATTACHMENTS: [:0]const u8 = PAGE_SELECT ++ "\n" ++ filtersFrom(true) ++ "\nORDER BY m.id ASC\nLIMIT $15 OFFSET $16;";
+const PAGE_QUERY_DESC_NO_ATTACHMENTS: [:0]const u8 = PAGE_SELECT ++ "\n" ++ filtersFrom(false) ++ "\nORDER BY m.id DESC\nLIMIT $15 OFFSET $16;";
+const PAGE_QUERY_ASC_NO_ATTACHMENTS: [:0]const u8 = PAGE_SELECT ++ "\n" ++ filtersFrom(false) ++ "\nORDER BY m.id ASC\nLIMIT $15 OFFSET $16;";
 
-const COUNT_QUERY: [:0]const u8 = "SELECT count(*)\n" ++ FILTERS_FROM ++ ";";
+const COUNT_QUERY: [:0]const u8 = "SELECT count(*)\n" ++ filtersFrom(null) ++ ";";
+const COUNT_QUERY_ATTACHMENTS: [:0]const u8 = "SELECT count(*)\n" ++ filtersFrom(true) ++ ";";
+const COUNT_QUERY_NO_ATTACHMENTS: [:0]const u8 = "SELECT count(*)\n" ++ filtersFrom(false) ++ ";";
+
+inline fn materializedPageQuery(comptime ascending: bool, comptime has_attachments: ?bool) [:0]const u8 {
+    const direction = if (ascending) "ASC" else "DESC";
+
+    return comptime "WITH matched AS MATERIALIZED (\nSELECT m.id\n" ++ filtersFrom(has_attachments) ++ "\n)\n" ++
+        PAGE_SELECT ++ "\nFROM (\nSELECT id FROM matched ORDER BY id " ++ direction ++
+        "\nLIMIT $15 OFFSET $16\n) page\nJOIN app.messages m ON m.id = page.id\nORDER BY m.id " ++ direction ++ ";";
+}
+
+inline fn pageQuery(ascending: bool, has_attachments: ?bool, materialize_matches: bool) [:0]const u8 {
+    if (materialize_matches) {
+        if (has_attachments) |has| {
+            if (has) {
+                return if (ascending) materializedPageQuery(true, true) else materializedPageQuery(false, true);
+            }
+
+            return if (ascending) materializedPageQuery(true, false) else materializedPageQuery(false, false);
+        }
+
+        return if (ascending) materializedPageQuery(true, null) else materializedPageQuery(false, null);
+    }
+
+    if (has_attachments) |has| {
+        if (has) {
+            return if (ascending) PAGE_QUERY_ASC_ATTACHMENTS else PAGE_QUERY_DESC_ATTACHMENTS;
+        }
+
+        return if (ascending) PAGE_QUERY_ASC_NO_ATTACHMENTS else PAGE_QUERY_DESC_NO_ATTACHMENTS;
+    }
+
+    return if (ascending) PAGE_QUERY_ASC else PAGE_QUERY_DESC;
+}
+
+inline fn countQuery(has_attachments: ?bool) [:0]const u8 {
+    if (has_attachments) |has| {
+        return if (has) COUNT_QUERY_ATTACHMENTS else COUNT_QUERY_NO_ATTACHMENTS;
+    }
+
+    return COUNT_QUERY;
+}
 
 /// Per-guild message search. Mirrors `repo.channels.GetMessages` (streamed) but
 /// with a fixed, fully parameterized filter query and `offset`/`limit`
@@ -117,6 +180,7 @@ pub const Search = struct {
         /// `true` for `sort=oldest` (id ascending), `false` for the default
         /// `sort=newest` (id descending).
         ascending: bool = false,
+        materialize_matches: bool = false,
         /// Caller whose per-reaction `me` flag is computed.
         me_user_id: root.types.UserId,
     };
@@ -300,7 +364,7 @@ pub const Search = struct {
 
             var formats: [17]root.db.Connection.Format = @splat(.binary);
 
-            const query = if (this.payload.ascending) PAGE_QUERY_ASC else PAGE_QUERY_DESC;
+            const query = pageQuery(this.payload.ascending, filters.has_attachments, this.payload.materialize_matches);
 
             switch (this.db.sendQueryParams(query, &params, &lengths, &formats, .binary)) {
                 .ready => this.state = .waiting,
@@ -618,7 +682,7 @@ pub const Count = struct {
 
             var formats: [14]root.db.Connection.Format = @splat(.binary);
 
-            switch (this.db.sendQueryParams(COUNT_QUERY, &params, &lengths, &formats, .binary)) {
+            switch (this.db.sendQueryParams(countQuery(filters.has_attachments), &params, &lengths, &formats, .binary)) {
                 .ready => this.state = .waiting,
                 .err => |err| {
                     SCOPE.err("Count failed to send query: {s}", .{this.db.errorMessage()});

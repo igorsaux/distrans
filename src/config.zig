@@ -53,6 +53,8 @@ pub const Options = struct {
     pub const Db = struct {
         conninfo: [:0]const u8 = "",
         pool: usize = 10,
+        /// Maximum runtime of a pooled SQL statement; zero disables the limit.
+        statement_timeout_ms: usize = 5000,
     };
 
     pub const Api = struct {
@@ -867,6 +869,16 @@ pub fn parseConfig(io: std.Io, arena: std.mem.Allocator, path: []const u8) !Opti
             }
 
             options.db.pool = @intCast(pool_value.integer);
+        }
+
+        if (db_value.object.get("statement_timeout_ms")) |statement_timeout_ms_value| {
+            if (statement_timeout_ms_value != .integer or statement_timeout_ms_value.integer < 0) {
+                std.log.err("'db.statement_timeout_ms' must be a non-negative integer", .{});
+
+                return error.BadConfig;
+            }
+
+            options.db.statement_timeout_ms = @intCast(statement_timeout_ms_value.integer);
         }
     }
 

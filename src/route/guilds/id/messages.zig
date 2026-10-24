@@ -181,9 +181,14 @@ const SearchTask = struct {
             }
         }
 
-        // R4
-        // await this.count_task
-        {
+        const count_before_search = this.filters.channels.len != 0 or
+            this.filters.authors.len != 0 or
+            this.filters.mentions.len != 0 or
+            this.filters.mention_roles.len != 0;
+
+        if (count_before_search) {
+            // R4
+            // await this.count_task
             if (this.count_task == null) {
                 this.count_task = .from(.init(
                     this.response.allocator,
@@ -199,38 +204,66 @@ const SearchTask = struct {
             this.total = this.count_task.?.result;
         }
 
-        // R4
-        // await this.search_stream
-        {
-            if (this.search_stream == null) {
-                this.search_stream = .from(.init(
-                    this.response.allocator,
-                    db,
-                    .{
-                        .filters = this.filters,
-                        .limit = this.payload.limit,
-                        .offset = this.payload.offset,
-                        .ascending = this.payload.ascending,
-                        .me_user_id = this.bearer_middleware_task.?.result.?,
-                    },
-                ));
-            }
-
-            while (this.search_stream.?.await()) |res| {
-                switch (res) {
-                    .next => |n| {
-                        const message = root.route.types.Message.fromRepo(this.response.allocator, n) catch |err| {
-                            return .{ .err = err };
-                        };
-
-                        this.result.append(this.response.allocator, message) catch |err| {
-                            SCOPE.err("GET failed to append a message: {t}", .{err});
-
-                            return .{ .err = err };
-                        };
-                    },
-                    .poll => |p| return p.discard(),
+        if (!count_before_search or this.total != 0) {
+            // R4
+            // await this.search_stream
+            {
+                if (this.search_stream == null) {
+                    this.search_stream = .from(.init(
+                        this.response.allocator,
+                        db,
+                        .{
+                            .filters = this.filters,
+                            .limit = this.payload.limit,
+                            .offset = this.payload.offset,
+                            .ascending = this.payload.ascending,
+                            .materialize_matches = count_before_search and this.total <= 100_000,
+                            .me_user_id = this.bearer_middleware_task.?.result.?,
+                        },
+                    ));
                 }
+
+                while (this.search_stream.?.await()) |res| {
+                    switch (res) {
+                        .next => |n| {
+                            const message = root.route.types.Message.fromRepo(this.response.allocator, n) catch |err| {
+                                return .{ .err = err };
+                            };
+
+                            this.result.append(this.response.allocator, message) catch |err| {
+                                SCOPE.err("GET failed to append a message: {t}", .{err});
+
+                                return .{ .err = err };
+                            };
+                        },
+                        .poll => |p| return p.discard(),
+                    }
+                }
+            }
+        }
+
+        const page_is_final = this.result.items.len < this.payload.limit;
+        const total_is_known = page_is_final and (this.payload.offset == 0 or this.result.items.len != 0);
+
+        if (!count_before_search) {
+            if (total_is_known) {
+                this.total = this.payload.offset + this.result.items.len;
+            } else {
+                // R4
+                // await this.count_task
+                if (this.count_task == null) {
+                    this.count_task = .from(.init(
+                        this.response.allocator,
+                        db,
+                        .{ .filters = this.filters },
+                    ));
+                }
+
+                while (this.count_task.?.await()) |res| {
+                    return res.discard();
+                }
+
+                this.total = this.count_task.?.result;
             }
         }
 

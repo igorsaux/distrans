@@ -3,6 +3,8 @@
 
 const std = @import("std");
 
+const pq = @import("pq");
+
 const root = @import("../root.zig");
 
 const SCOPE = std.log.scoped(.db);
@@ -29,6 +31,17 @@ pub const Pool = struct {
                 return err;
             };
             errdefer conn.deinit();
+
+            var query_buf: [64]u8 = undefined;
+            const query = std.fmt.bufPrintZ(&query_buf, "SET statement_timeout = {d}", .{root.options.db.statement_timeout_ms}) catch unreachable;
+            const res, const timeout_err = conn.execExpect(query, pq.PGRES_COMMAND_OK);
+            defer if (res) |r| r.deinit();
+
+            if (timeout_err != null) {
+                SCOPE.err("failed to set the statement timeout: {s}", .{timeout_err.?});
+
+                return Error.PGError;
+            }
 
             conn.pooled = true;
 
